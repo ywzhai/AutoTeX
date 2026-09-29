@@ -9,7 +9,7 @@
     minPrefix: 3,
     maxSuggestionLength: 400,
     sequenceEnd: "n",
-    debounceMs: 160,
+    debounceMs: 50,
   };
   const checkboxes = ["enabled", "expressions", "sequences"];
   const controls = Object.fromEntries(checkboxes.map((name) => [name, document.getElementById(name)]));
@@ -130,6 +130,7 @@
         for (const [name, minimum, maximum] of [["minPrefix", 1, 20], ["maxSuggestionLength", 20, 2000], ["debounceMs", 0, 2000]]) {
           if (Number.isInteger(saved[name]) && saved[name] >= minimum && saved[name] <= maximum) settings[name] = saved[name];
         }
+        if (settings.debounceMs === 160) settings.debounceMs = DEFAULTS.debounceMs;
         if (typeof saved.sequenceEnd === "string" && validEnd(saved.sequenceEnd.trim())) {
           const value = saved.sequenceEnd.trim();
           settings.sequenceEnd = /^\d+$/.test(value) ? String(Number(value)) : value;

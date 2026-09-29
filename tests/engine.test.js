@@ -239,3 +239,53 @@ test("unsupported nearby bound expressions cannot be truncated into false eviden
     assert.equal(result.endpointSource, "configured", end);
   }
 });
+
+test('current item wins over more frequent formulas in other answers', () => {
+  const marked = String.raw`\begin{enumerate}
+\item $f(x)=x+1$ $f(x)=x+1$ $f(x)=x+1$
+\item $f(x)=x+2$ Some reasoning. $f(x)|$
+\item $f(x)=x+1$
+\end{enumerate}`;
+  assert.equal(suffix(marked), '=x+2');
+});
+
+test('subitems prefer their own notation, then parent, and exclude sibling evidence from the parent scope', () => {
+  const start = String.raw`\begin{enumerate}\item $f(x)=x+1$
+\begin{enumerate}\item $f(x)=x+2$`;
+  assert.equal(suffix(start + ' $f(x)|$'), '=x+2');
+  assert.equal(suffix(start + String.raw`\item $f(x)|$\end{enumerate}\end{enumerate}`), '=x+1');
+  assert.equal(suffix(start + String.raw`\end{enumerate} $f(x)|$\end{enumerate}`), '=x+1');
+});
+
+test('an answer-local bound outweighs a complete indexed list from another item', () => {
+  const marked = String.raw`\begin{enumerate}
+\item $x_1,x_2,\ldots,x_N$
+\item $x_i,1\le i\le m$ $x_1,x_2|$
+\end{enumerate}`;
+  const result = suggest(marked);
+  assert.equal(result.insertText, ',\\ldots,x_m');
+  assert.equal(result.endpointSource, 'nearby-bound');
+});
+
+test('scope changes after edits, and training collection shares the runtime math gate', () => {
+  const engine = createEngine();
+  for (const value of ['2', '3']) {
+    const text = String.raw`\item $f(x)=x+1$\item $f(x)=x+` + value + '$ $f(x)';
+    assert.equal(engine.suggest(text, text.length).insertText, '=x+' + value);
+    const collection = engine.collectCandidates(text, text.length);
+    assert.equal(collection.context.itemId, 2);
+    assert.ok(collection.candidates.some((candidate) => candidate.insertText === '=x+' + value && candidate.itemTier === 2));
+  }
+  assert.equal(engine.collectCandidates('$a+b$ prose', 11), null);
+  assert.equal(engine.isMathContext('$x+y$ after', 11), false);
+});
+
+test('no trained artifact is required for document prediction and invalid models preserve existing completions', () => {
+  const engine = createEngine({ model: { schemaVersion: -1 } });
+  assert.equal(engine.suggest('$x^2+y^2$ $x^2', 14)?.insertText, '+y^2');
+});
+
+test('masked prose does not turn a reused expression into a dangling operator suggestion', () => {
+  const result = suggest('$x+a+\\text{hello}+b$ $x+a|$');
+  assert.notEqual(result?.insertText.trim(), '+');
+});

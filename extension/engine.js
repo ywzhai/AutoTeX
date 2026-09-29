@@ -1,8 +1,12 @@
 (function (root, factory) {
-  const api = factory();
+  const commonJS = typeof module === 'object' && module.exports;
+  const Context = commonJS ? require('./context.js') : root.AutoTexContext;
+  const Predictor = commonJS ? require('./predictor.js') : root.AutoTexPredictor;
+  const model = commonJS ? require('./model.js') : root.AutoTexModel;
+  const api = factory(Context, Predictor, model);
   if (typeof module === 'object' && module.exports) module.exports = api;
   root.MathAutocompleteEngine = api;
-})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+})(typeof globalThis !== 'undefined' ? globalThis : this, function (Context, Predictor, bundledModel) {
   'use strict';
 
   const DEFAULT_SETTINGS = Object.freeze({
@@ -12,112 +16,14 @@
     minPrefix: 3,
     maxSuggestionLength: 400,
     sequenceEnd: 'n',
-    debounceMs: 160
+    debounceMs: 50
   });
-  const MATH_ENVIRONMENTS = /^(?:equation|align|alignat|gather|multline|eqnarray|flalign|math|displaymath)\*?$/;
   const BASE_SOURCE = String.raw`(?:\\(?:mathrm|mathbf|mathit|mathsf|mathtt|boldsymbol|bm)\s*\{(?:\\[A-Za-z]+|[A-Za-z])\}|\\[A-Za-z]+|\{(?:\\[A-Za-z]+|[A-Za-z])\}|[A-Za-z])`;
   const TERM_SOURCE = '(' + BASE_SOURCE + ')' + String.raw`\s*_\s*(?:\{(\d+)\}|(\d+))`;
   const compact = (value) => value.replace(/\s+/g, '');
   const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-  function escaped(text, position) {
-    let count = 0;
-    while (position > 0 && text[--position] === '\\') count++;
-    return count % 2 === 1;
-  }
-
-  // Preserve positions while masking comments. No document content leaves this engine.
-  function maskComments(text) {
-    const pieces = [];
-    let start = 0;
-    for (let position = 0; position < text.length; position++) {
-      if (text[position] !== '%' || escaped(text, position)) continue;
-      let end = position;
-      while (end < text.length && text[end] !== '\r' && text[end] !== '\n') end++;
-      pieces.push(text.slice(start, position), ' '.repeat(end - position));
-      start = end;
-      position = end - 1;
-    }
-    pieces.push(text.slice(start));
-    return pieces.join('');
-  }
-
-  function inComment(text, cursor) {
-    const line = text.lastIndexOf('\n', cursor - 1) + 1;
-    for (let i = line; i < cursor; i++) {
-      if (text[i] === '%' && !escaped(text, i)) return true;
-    }
-    return false;
-  }
-
-  function maskLiteralRegions(text) {
-    const commands = /\\begin\{(verbatim\*?|Verbatim|BVerbatim|LVerbatim|SaveVerbatim|lstlisting|minted|comment)\}|\\(?:verb\*?|lstinline\*?)(?![A-Za-z])/g;
-    const pieces = [];
-    const excluded = [];
-    let start = 0;
-    let match;
-    while ((match = commands.exec(text))) {
-      if (escaped(text, match.index) || inComment(text, match.index)) continue;
-      let end;
-      let closed;
-      if (match[1]) {
-        const closing = '\\end{' + match[1] + '}';
-        const closingStart = text.indexOf(closing, commands.lastIndex);
-        closed = closingStart >= 0;
-        end = closed ? closingStart + closing.length : text.length;
-      } else {
-        let delimiterStart = commands.lastIndex;
-        if (match[0].startsWith('\\lstinline') && text[delimiterStart] === '[') {
-          const optionEnd = text.indexOf(']', delimiterStart + 1);
-          if (optionEnd < 0) continue;
-          delimiterStart = optionEnd + 1;
-        }
-        const delimiter = text[delimiterStart];
-        if (!delimiter || /\s/.test(delimiter)) continue;
-        const lineEnd = text.indexOf('\n', delimiterStart + 1);
-        const boundary = lineEnd < 0 ? text.length : lineEnd;
-        const closingStart = text.indexOf(delimiter === '{' ? '}' : delimiter, delimiterStart + 1);
-        closed = closingStart >= 0 && closingStart < boundary;
-        end = closed ? closingStart + 1 : boundary;
-      }
-      excluded.push({ start: match.index, end, closed });
-      pieces.push(text.slice(start, match.index), text.slice(match.index, end).replace(/[^\r\n]/g, ' '));
-      start = end;
-      commands.lastIndex = end;
-    }
-    pieces.push(text.slice(start));
-    return { text: pieces.join(''), excluded };
-  }
-
-  function parseMath(text) {
-    const literals = maskLiteralRegions(text);
-    const clean = maskComments(literals.text);
-    const regions = [];
-    const tokens = /\\(?:begin|end)\{([^}]+)\}|\\[()[\]]|\$\$?/g;
-    let active = null;
-    let token;
-    while ((token = tokens.exec(clean))) {
-      if (escaped(clean, token.index)) continue;
-      const value = token[0];
-      if (!active) {
-        let close;
-        if (value === '$' || value === '$$') close = value;
-        else if (value === '\\(') close = '\\)';
-        else if (value === '\\[') close = '\\]';
-        else if (value.startsWith('\\begin{') && MATH_ENVIRONMENTS.test(token[1])) {
-          close = '\\end{' + token[1] + '}';
-        }
-        if (close) active = { start: tokens.lastIndex, end: clean.length, close, closed: false };
-      } else if (value === active.close) {
-        active.end = token.index;
-        active.closed = true;
-        regions.push(active);
-        active = null;
-      }
-    }
-    if (active) regions.push(active);
-    return { clean, regions, literalText: literals.text, excluded: literals.excluded };
-  }
+  const escaped = Context.escaped;
 
   function trimOverlap(insertText, right) {
     const limit = Math.min(insertText.length, right.length);
@@ -159,6 +65,16 @@
   }
 
   function inferEndpoint(parsed, base, firstNumber, cursor, settings) {
+    // Evidence from this answer takes priority even over a complete list in
+    // another answer. A nested subitem can fall back to its parent afterward.
+    if (!parsed.scopeFiltered && Context.itemAt(parsed, cursor)) {
+      for (const tier of [2, 1, 0]) {
+        const scoped = { ...parsed, scopeFiltered: true,
+          regions: parsed.regions.filter((region) => Context.scopeTier(parsed, cursor, region.start) === tier) };
+        const result = inferEndpoint(scoped, base, firstNumber, cursor, settings);
+        if (result.source === 'previous-list' || result.source === 'nearby-bound') return result;
+      }
+    }
     const literal = escapeRegex(base).replace(/\s+/g, '\\s*');
     const index = String.raw`_\s*(?:\{([^{}]+)\}|([A-Za-z]|\d+|\\[A-Za-z]+))`;
     const prior = new RegExp(literal + index + String.raw`\s*,\s*` + literal + index +
@@ -175,7 +91,7 @@
         const endpoint = (match[6] || match[7]).trim();
         if (!Number.isInteger(first) || second !== first + 1 || !/^(?:[A-Za-z]|\d+|\\[A-Za-z]+|[A-Za-z]\s*[-+]\s*\d+)$/.test(endpoint)) continue;
         const score = Math.abs(cursor - position) + (first === firstNumber ? 0 : 10000);
-        if (!best || score < best.score) best = { value: endpoint, dots: match[5], score, source: 'previous-list' };
+        if (!best || score < best.score) best = { value: endpoint, dots: match[5], score, source: 'previous-list', position };
       }
     }
     if (best) return best;
@@ -199,7 +115,7 @@
         const remainder = body.slice(bound.index + bound[0].length).trimStart();
         // Do not treat the first token of an unsupported expression as its endpoint.
         if (/^(?:[-+*\/^_(A-Za-z0-9]|\\(?:cdot|times|frac|over|div|ast)\b)/.test(remainder)) continue;
-        return { value: bound[1], dots: '\\ldots', source: 'nearby-bound' };
+        return { value: bound[1], dots: '\\ldots', source: 'nearby-bound', position: region.start };
       }
     }
     const configured = typeof settings.sequenceEnd === 'string' || typeof settings.sequenceEnd === 'number'
@@ -266,7 +182,11 @@
     else if (beforeRun.endsWith('{')) suffix += '}';
     else if (beforeRun.endsWith('(')) suffix += ')';
     else if (beforeRun.endsWith('[')) suffix += ']';
-    return finish(suffix, 'sequence', 'Complete indexed sequence', text, cursor, settings, { endpointSource: endpoint.source });
+    return finish(suffix, 'sequence', 'Complete indexed sequence', text, cursor, settings, {
+      endpointSource: endpoint.source, position: endpoint.position,
+      itemTier: endpoint.position == null ? 0 : Context.scopeTier(parsed, cursor, endpoint.position),
+      features: { sourceSequence: 1, prefixLength: fragment.length, length: suffix.length }
+    });
   }
 
   function compactWithPositions(value) {
@@ -280,32 +200,23 @@
 
   function expressionCandidates(parsed, cursor, maxLength) {
     const candidates = [];
-    for (const region of parsed.regions) {
-      const content = parsed.clean.slice(region.start, region.end);
-      const rows = /\\\\(?:\[[^\]]*\])?|\r?\n/g;
-      let rowStart = 0;
-      let match;
-      do {
-        match = rows.exec(content);
-        const raw = content.slice(rowStart, match ? match.index : content.length);
-        const start = region.start + rowStart;
-        const end = start + raw.length;
-        if (!(start <= cursor && cursor <= end)) {
-          const value = raw.replace(/\\(?:label|tag)\{[^}]*\}/g, '').replace(/\\(?:nonumber|notag)\b/g, '').replace(/&/g, '').trim();
-          if (value.length >= 3 && value.length <= maxLength && !/\\(?:begin|end)\{/.test(value)) {
-            candidates.push({ value, position: start, normalized: compactWithPositions(value) });
-          }
-        }
-        rowStart = match ? rows.lastIndex : content.length;
-      } while (match);
+    for (const segment of parsed.segments || Context.mathSegments(parsed)) {
+      const { start, end } = segment;
+      if (start <= cursor && cursor <= end) continue;
+      const value = parsed.clean.slice(start, end).replace(/\\&|&/g, (match) => match === '&' ? '' : match)
+        .replace(/\\(?:nonumber|notag)\b/g, '').trim();
+      if (/[=+\-*/^_]$/.test(value) && parsed.textRanges.some((range) => range.commandStart === end)) continue;
+      if (value.length >= 3 && value.length <= maxLength && !/\\(?:begin|end)\{/.test(value)) {
+        candidates.push({ value, position: start, itemId: segment.itemId, normalized: compactWithPositions(value) });
+      }
     }
     return candidates;
   }
 
-  function expressionSuggestion(parsed, region, text, cursor, settings) {
+  function expressionSuggestions(parsed, region, text, cursor, settings) {
     const fragment = parsed.clean.slice(Math.max(region.start, cursor - settings.maxSuggestionLength), cursor);
     const row = fragment.split(/\\\\|\r?\n/).pop();
-    if (!row.trim() || /\\(?:text|textrm|textit|textbf|mbox)\{[^}]*$/.test(row)) return null;
+    if (!row.trim() || /\\(?:text|textrm|textit|textbf|mbox)\{[^}]*$/.test(row)) return [];
     const prefixes = [row.trimStart()];
     const boundaries = /[=+,;&]|\\(?:approx|equiv|leq?|geq?)\b/g;
     let boundary;
@@ -313,7 +224,7 @@
     const sources = expressionCandidates(parsed, cursor, settings.maxSuggestionLength);
     const frequencies = new Map();
     for (const source of sources) frequencies.set(source.normalized.value, (frequencies.get(source.normalized.value) || 0) + 1);
-    let best = null;
+    const results = [];
     for (const prefix of prefixes) {
       const needle = compact(prefix);
       if (needle.length < settings.minPrefix) continue;
@@ -334,14 +245,20 @@
               const distance = Math.abs(cursor - source.position);
               const frequency = frequencies.get(source.normalized.value);
               const score = needle.length * 10000 + frequency * 150 - Math.min(distance, 10000) - occurrence * 2;
-              if (!best || score > best.score) best = { suffix, score, source: source.value };
+              const candidate = finish(suffix, 'expression', 'Reuse expression from this document', text, cursor, settings, {
+                source: source.value, position: source.position, itemId: source.itemId,
+                itemTier: Context.scopeTier(parsed, cursor, source.position), legacyScore: score,
+                features: { sourceExpression: 1, prefixLength: needle.length, localFrequency: frequency,
+                  distance, length: suffix.length }
+              });
+              if (candidate) results.push(candidate);
             }
           }
           occurrence = source.normalized.value.indexOf(needle, occurrence + 1);
         }
       }
     }
-    return best ? finish(best.suffix, 'expression', 'Reuse expression from this document', text, cursor, settings, { source: best.source }) : null;
+    return results.sort((a, b) => b.itemTier - a.itemTier || b.legacyScore - a.legacyScore).slice(0, 24);
   }
 
   function balancedTail(prefix, suffix) {
@@ -365,55 +282,111 @@
     return suffix;
   }
 
-  function inTextCommand(value) {
-    const commands = /\\(?:text|textrm|textit|textbf|textnormal|textsf|texttt|mbox|operatorname)\*?\s*\{/g;
-    let match;
-    while ((match = commands.exec(value))) {
-      if (escaped(value, match.index)) continue;
-      let depth = 1;
-      let position = commands.lastIndex;
-      while (position < value.length && depth > 0) {
-        if (!escaped(value, position)) {
-          if (value[position] === '{') depth++;
-          else if (value[position] === '}') depth--;
-        }
-        position++;
-      }
-      if (depth > 0) return true;
-      commands.lastIndex = position;
-    }
-    return false;
-  }
 
   function createEngine(initialSettings) {
     let cachedText;
     let cachedParse;
+    let artifact = initialSettings?.model ?? bundledModel ?? undefined;
+    let predictor = Predictor.createPredictor(artifact);
+
+    function parse(documentText) {
+      if (cachedText !== documentText) {
+        cachedText = documentText;
+        cachedParse = Context.analyzeDocument(documentText);
+        cachedParse.segments = Context.mathSegments(cachedParse);
+      }
+      return cachedParse;
+    }
+
+    function collectCandidates(documentText, cursor, overrides) {
+      if (typeof documentText !== 'string' || !Number.isInteger(cursor) || cursor < 0 || cursor > documentText.length) return null;
+      const settings = Object.assign({}, DEFAULT_SETTINGS, initialSettings, overrides);
+      if (!settings.enabled) return null;
+      settings.minPrefix = Math.max(1, Math.min(30, Number(settings.minPrefix) || DEFAULT_SETTINGS.minPrefix));
+      settings.maxSuggestionLength = Math.max(1, Math.min(2000, Number(settings.maxSuggestionLength) || DEFAULT_SETTINGS.maxSuggestionLength));
+      const parsed = parse(documentText);
+      const active = Context.contextAt(parsed, cursor);
+      if (!active) return null;
+      const { region, itemId, ancestorIds } = active;
+      const before = parsed.clean.slice(Math.max(region.start, cursor - settings.maxSuggestionLength), cursor);
+      const prefix = before.split(/\\\\|\r?\n/).pop();
+      const segments = parsed.segments.filter((segment) => !(segment.start <= cursor && cursor <= segment.end))
+        .sort((a, b) => Context.scopeTier(parsed, cursor, b.start) - Context.scopeTier(parsed, cursor, a.start) ||
+          Math.abs(a.start - cursor) - Math.abs(b.start - cursor)).slice(0, 128);
+      const context = { prefix, right: parsed.clean.slice(cursor, Math.min(region.end, cursor + settings.maxSuggestionLength)),
+        segments, itemId, ancestorIds, cursor, maxTokens: 12, maxCandidates: 32 };
+      const candidates = [];
+      if (settings.sequences) {
+        const sequence = sequenceSuggestion(parsed, region, documentText, cursor, settings);
+        if (sequence) candidates.push(sequence);
+      }
+      if (settings.expressions) {
+        candidates.push(...expressionSuggestions(parsed, region, documentText, cursor, settings));
+        // Generative v1 fills the end of an expression or an auto-paired group.
+        // Existing expression retrieval can still fill known gaps in other text.
+        if (compact(prefix).length >= settings.minPrefix && /^[\s}\])]*$/.test(context.right)) {
+          for (const proposal of predictor.candidates(context)) {
+            const result = finish(proposal.fullText ?? proposal.insertText, proposal.kind || 'prediction',
+              'Predict a mathematical continuation', documentText, cursor, settings, proposal);
+            // The provider owns features, but never the final insertion/overlap checks.
+            if (result) {
+              result.fullText = proposal.fullText ?? proposal.insertText;
+              result.insertText = trimOverlap(result.fullText, documentText.slice(cursor, cursor + settings.maxSuggestionLength));
+              result.itemTier = proposal.itemTier ?? proposal.scopeTier ??
+                (proposal.features?.sameItem > 0 ? 2 : proposal.features?.parentItem > 0 ? 1 : 0);
+              candidates.push(result);
+            }
+          }
+        }
+      }
+      const unique = new Map();
+      for (const candidate of candidates) {
+        if (!candidate.insertText?.trim()) continue;
+        candidate.scopeTier = candidate.itemTier;
+        candidate.features = { ...candidate.features, sameItem: candidate.itemTier === 2 ? 1 : 0,
+          parentItem: candidate.itemTier === 1 ? 1 : 0,
+          sameItemEvidence: candidate.features?.sameItemEvidence ?? (candidate.itemTier === 2 ? 1 : 0),
+          ancestorEvidence: candidate.features?.ancestorEvidence ?? (candidate.itemTier === 1 ? 1 : 0) };
+        const previous = unique.get(candidate.insertText);
+        if (!previous || candidate.itemTier > previous.itemTier) unique.set(candidate.insertText, candidate);
+      }
+      return { candidates: [...unique.values()].sort((a, b) => b.itemTier - a.itemTier).slice(0, 32), context };
+    }
+
     return {
+      collectCandidates,
       suggest(documentText, cursor, overrides) {
-        if (typeof documentText !== 'string' || !Number.isInteger(cursor) || cursor < 0 || cursor > documentText.length) return null;
-        const settings = Object.assign({}, DEFAULT_SETTINGS, initialSettings, overrides);
-        if (!settings.enabled) return null;
-        settings.minPrefix = Math.max(1, Math.min(30, Number(settings.minPrefix) || DEFAULT_SETTINGS.minPrefix));
-        settings.maxSuggestionLength = Math.max(1, Math.min(2000, Number(settings.maxSuggestionLength) || DEFAULT_SETTINGS.maxSuggestionLength));
-        if (cachedText !== documentText) {
-          cachedText = documentText;
-          cachedParse = parseMath(documentText);
+        const collected = collectCandidates(documentText, cursor, overrides);
+        if (!collected?.candidates.length) return null;
+        const ranked = predictor.rank(collected.candidates, collected.context);
+        // Scope priority is a product requirement, independent of learned weights.
+        ranked.sort((a, b) => b.itemTier - a.itemTier);
+        if (!predictor.trained) {
+          const bestTier = ranked[0]?.itemTier ?? 0;
+          const reliable = collected.candidates.filter((candidate) => candidate.itemTier === bestTier &&
+            (candidate.kind === 'sequence' || candidate.kind === 'expression'));
+          reliable.sort((a, b) => Number(b.kind === 'sequence') - Number(a.kind === 'sequence') ||
+            (b.legacyScore || 0) - (a.legacyScore || 0));
+          if (reliable.length) return reliable[0];
         }
-        if (inComment(cachedParse.literalText, cursor) || cachedParse.excluded.some((item) =>
-          cursor > item.start && (cursor < item.end || (!item.closed && cursor === item.end)))) return null;
-        const region = cachedParse.regions.find((item) => cursor >= item.start && cursor <= item.end);
-        if (!region) return null;
-        const before = cachedParse.clean.slice(region.start, cursor);
-        if (inTextCommand(before)) return null;
-        if (settings.sequences) {
-          const sequence = sequenceSuggestion(cachedParse, region, documentText, cursor, settings);
-          if (sequence) return sequence;
-        }
-        return settings.expressions ? expressionSuggestion(cachedParse, region, documentText, cursor, settings) : null;
+        const threshold = predictor.trained && Number.isFinite(artifact?.training?.recommendedThreshold)
+          ? Math.max(0, Math.min(1, artifact.training.recommendedThreshold)) : 0;
+        return ranked[0]?.score >= threshold ? ranked[0] : null;
       },
-      reset() { cachedText = undefined; cachedParse = undefined; }
+      isMathContext(documentText, cursor) {
+        return typeof documentText === 'string' && Boolean(Context.contextAt(parse(documentText), cursor));
+      },
+      setModel(nextArtifact) { artifact = nextArtifact; predictor = Predictor.createPredictor(artifact); return predictor.valid; },
+      reset() { cachedText = undefined; cachedParse = undefined; predictor.reset(); }
     };
   }
 
-  return { DEFAULT_SETTINGS, createEngine };
+  let gateText, gateParse;
+  function isMathContext(text, cursor) {
+    if (typeof text !== 'string') return false;
+    if (gateText !== text) { gateText = text; gateParse = Context.analyzeDocument(text); }
+    return Boolean(Context.contextAt(gateParse, cursor));
+  }
+
+  return { DEFAULT_SETTINGS, createEngine, isMathContext };
 });

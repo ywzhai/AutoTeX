@@ -27,11 +27,12 @@ entries.push({ name: "INSTALL.txt", bytes: Buffer.from(
   "2. Open chrome://extensions and enable Developer mode.\r\n" +
   "3. Click Load unpacked and select this extracted folder (contains manifest.json).\r\n" +
   "4. Reload Overleaf and use the Code Editor.\r\n\r\n" +
-  "Type within LaTeX math: repeat the first three characters of an existing formula,\r\n" +
-  "or start a sequence such as x_1,x_2. Grey text previews the suggested continuation.\r\n" +
+  "Type within LaTeX math to reuse document expressions, continue math patterns,\r\n" +
+  "or extend a sequence such as x_1,x_2. Grey text previews the continuation.\r\n" +
   "Tab accepts. Esc dismisses. Undo removes acceptance.\r\n\r\n" +
   "The extension popup controls features and the default final index.\r\n" +
-  "Suggestions use only the open source file and run locally. No API key needed.\r\n" +
+  "Suggestions run locally. Document text is never uploaded. No API key needed.\r\n" +
+  "The included model.js identifies whether trained corpus data is installed.\r\n" +
   "Unofficial extension; not affiliated with Overleaf.\r\n", "utf8") });
 const localRecords = [], centralRecords = [];
 let offset = 0;

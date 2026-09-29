@@ -62,7 +62,7 @@ test.after(async () => {
   if (server) await new Promise((resolve) => server.close(resolve));
 });
 
-async function fixture(t) {
+async function fixture(t, options = {}) {
   const context = await browser.newContext({ viewport: { width: 1100, height: 700 } });
   context.setDefaultTimeout(5000);
   const page = await context.newPage();
@@ -72,6 +72,12 @@ async function fixture(t) {
     await context.close();
     assert.deepEqual(errors, [], "The fixture should have no uncaught browser errors");
   });
+  if (Object.hasOwn(options, "modelArtifact")) {
+    await page.route("**/extension/model.js", (route) => route.fulfill({
+      contentType: "text/javascript",
+      body: "globalThis.AutoTexModel = " + JSON.stringify(options.modelArtifact) + ";",
+    }));
+  }
   await page.goto(`${baseURL}/tests/fixture.html`);
   await page.waitForFunction(() => window.fixture?.extensionEvents >= 2);
   await page.locator('[aria-label="Source Editor editing"]').click();
@@ -623,6 +629,70 @@ test("a closer borrowed by the initial preview survives typing past its original
   await page.keyboard.press("Tab");
   assert.equal(await documentText(page), "$f(ab)+g(b)$\n$f(ab)+g(b)");
   await noGhost(page);
+});
+
+test("formula reuse prioritizes the current list item over a repeated neighboring formula", async (t) => {
+  const page = await fixture(t);
+  const marked = "\\begin{enumerate}\n" +
+    "\\item $f(x)=x+1$. Also $f(x)=x+1$.\n" +
+    "\\item $f(x)=x+2$. Therefore $f(x)|$.\n" +
+    "\\item $f(x)=x+1$.\n\\end{enumerate}";
+  await setDocument(page, marked);
+  assert.equal(await ghostText(page), "=x+2");
+  await page.keyboard.type("=x");
+  assert.equal(await page.locator(ghostSelector).textContent(), "+2");
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), marked.replace("f(x)|", "f(x)=x+2"));
+});
+
+test("closing math clears the preview and prose cannot acquire a new one", async (t) => {
+  const page = await fixture(t);
+  await setDocument(page, "$a^2+b^2=c^2$\n$a^2|");
+  await ghostText(page);
+  await page.keyboard.type("$");
+  assert.equal(await page.locator(ghostSelector).count(), 0, "Closing the math delimiter clears the preview immediately");
+  await page.keyboard.type(" Ordinary text x_1,x_2");
+  await noGhost(page);
+  const before = await documentText(page);
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), before);
+  assert.equal(await page.evaluate(() => window.fixture.tabFallbackCount), 1);
+});
+
+test("entering a text command clears previews and prevents mathematical predictions", async (t) => {
+  const page = await fixture(t);
+  await setDocument(page, "$x+a+\\text{hello}+b$\n$x+a|$");
+  await ghostText(page);
+  await page.keyboard.type("+\\text{");
+  assert.equal(await page.locator(ghostSelector).count(), 0, "Text-command content must never retain a math preview");
+  await page.keyboard.type("hel");
+  await noGhost(page);
+  const before = await documentText(page);
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), before);
+  assert.equal(await page.evaluate(() => window.fixture.tabFallbackCount), 1);
+});
+
+test("comments and verbatim content never show math predictions", async (t) => {
+  const page = await fixture(t);
+  for (const marked of [
+    "$x_1,x_2,\\ldots,x_n$\n% $x_1,x_2|",
+    "$x_1,x_2,\\ldots,x_n$\n\\verb!$x_1,x_2|!",
+    "$x_1,x_2,\\ldots,x_n$\n\\begin{verbatim}\n$x_1,x_2|\n\\end{verbatim}",
+  ]) {
+    await setDocument(page, marked);
+    await noGhost(page);
+  }
+});
+
+test("an invalid installed model falls back to document completions", async (t) => {
+  const page = await fixture(t, {
+    modelArtifact: { schemaVersion: 999, tokenizerVersion: "unknown", trained: true, ngrams: "invalid", ranker: { weights: ["invalid"] } },
+  });
+  await setDocument(page, "$a^2+b^2=c^2$\n$a^2|$");
+  assert.equal(await ghostText(page), "+b^2=c^2");
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), "$a^2+b^2=c^2$\n$a^2+b^2=c^2$");
 });
 
 

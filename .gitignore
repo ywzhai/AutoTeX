@@ -3,3 +3,6 @@ tests/.generated/
 test-results/
 dist/
 .pnpm-store/
+artifacts/
+dataset/
+datasets/

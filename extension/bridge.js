@@ -11,7 +11,7 @@
     minPrefix: 3,
     maxSuggestionLength: 400,
     sequenceEnd: "n",
-    debounceMs: 160,
+    debounceMs: 50,
   });
   const STATUSES = new Set(["connected", "waiting", "unsupported", "disabled"]);
   let settings = { ...DEFAULTS };
@@ -36,6 +36,8 @@
         result[name] = source[name];
       }
     }
+    // Migrate the old built-in delay, which the popup used to save implicitly.
+    if (result.debounceMs === 160) result.debounceMs = DEFAULTS.debounceMs;
     return result;
   }
 

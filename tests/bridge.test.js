@@ -18,7 +18,7 @@ const DEFAULTS = {
   minPrefix: 3,
   maxSuggestionLength: 400,
   sequenceEnd: "n",
-  debounceMs: 160,
+  debounceMs: 50,
 };
 
 // Exercise the actual content script with controlled Chrome/browser boundaries.
@@ -96,6 +96,14 @@ function assertSettingsMessage(entry, expected) {
     origin: ORIGIN,
   });
 }
+
+test('existing installations migrate the former implicit delay while retaining other preferences', () => {
+  const bridge = harness();
+  bridge.loadStorage({ debounceMs: 160, expressions: false, sequenceEnd: 'M' });
+  assert.equal(bridge.latestSettings().debounceMs, 50);
+  assert.equal(bridge.latestSettings().expressions, false);
+  assert.equal(bridge.latestSettings().sequenceEnd, 'M');
+});
 
 test("bridge loads only its saved settings key and forwards a sanitized settings message", () => {
   const bridge = harness();

@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "AutoTeX",
-  "version": "1.1.0",
-  "description": "Reuse math expressions and complete indexed sequences in Overleaf with inline suggestions. Unofficial, private, and local.",
+  "version": "1.2.0",
+  "description": "Local mathematical completions for Overleaf, prioritizing the current answer. Grey previews and Tab acceptance. Unofficial.",
   "minimum_chrome_version": "111",
   "permissions": ["storage"],
   "icons": { "16": "icon16.png", "32": "icon32.png", "48": "icon48.png", "128": "icon128.png" },
@@ -14,7 +14,7 @@
   "content_scripts": [
     {
       "matches": ["https://www.overleaf.com/project/*", "https://overleaf.com/project/*"],
-      "js": ["engine.js", "editor.js"],
+      "js": ["context.js", "predictor.js", "model.js", "engine.js", "editor.js"],
       "run_at": "document_idle",
       "world": "MAIN"
     },

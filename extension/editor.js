@@ -4,6 +4,7 @@
   const CHANNEL = "overleaf-math-autocomplete";
   const instances = new Set();
   const extensionCache = new WeakMap();
+  const mathContextCache = new WeakMap();
   let settings = { ...MathAutocompleteEngine.DEFAULT_SETTINGS };
   let receivedSettings = false;
   let hookSeen = false;
@@ -31,6 +32,21 @@
       selection.ranges.length === 1 && selection.main.empty && view.hasFocus &&
       !view.composing && !view.compositionStarted && view.dom.isConnected &&
       view.dom.getClientRects().length > 0;
+  }
+
+  function isMathContext(document, position, engine) {
+    const cached = mathContextCache.get(document);
+    if (cached?.position === position) return cached.allowed;
+    const owner = typeof engine?.isMathContext === "function" ? engine : MathAutocompleteEngine;
+    let allowed = false;
+    try {
+      // A missing or failed context parser must never make prose completable.
+      allowed = typeof owner.isMathContext === "function" && owner.isMathContext(document.toString(), position) === true;
+    } catch {
+      allowed = false;
+    }
+    mathContextCache.set(document, { position, allowed });
+    return allowed;
   }
 
   function createExtension(CM) {
@@ -135,7 +151,8 @@
         return value && !transaction.state.readOnly && transaction.state.facet(EditorView.editable) &&
           transaction.state.selection.ranges.length === 1 && transaction.state.selection.main.empty &&
           value.doc === transaction.state.doc &&
-          value.pos === transaction.state.selection.main.head ? value : null;
+          value.pos === transaction.state.selection.main.head &&
+          isMathContext(transaction.state.doc, value.pos) ? value : null;
       },
       provide: (field) => EditorView.decorations.from(field, (value) => value?.insertText ?
         Decoration.set([Decoration.widget({ widget: new Ghost(value.insertText), side: 1 }).range(value.pos)]) :
@@ -190,6 +207,7 @@
           this.timer = null;
           if (!this.alive || this.composing || !sourceIsEditable(this.view) ||
               this.view.state.doc !== document || this.view.state.selection.main.head !== position) return;
+          if (!isMathContext(document, position, this.engine)) return;
           const result = this.engine.suggest(document.toString(), position, settings);
           if (!result) return;
           this.view.dispatch({ effects: setSuggestion.of({ ...result, doc: document, pos: position }) });
@@ -226,6 +244,7 @@
         const view = this.view;
         if (!value || !sourceIsEditable(view) || view.state.doc !== value.doc ||
             view.state.selection.main.head !== value.pos ||
+            !isMathContext(view.state.doc, value.pos, this.engine) ||
             !view.dom.querySelector(".ol-math-ghost")) return;
         this.cancelTimer();
         event.preventDefault();

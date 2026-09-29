@@ -1,0 +1,174 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const vm = require('node:vm');
+const Predictor = require('../extension/predictor.js');
+const Training = require('../scripts/train-model.cjs');
+
+function temporary(t) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'autotex-training-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  return directory;
+}
+
+function write(directory, name, text) {
+  const filename = path.join(directory, name);
+  fs.mkdirSync(path.dirname(filename), { recursive: true });
+  fs.writeFileSync(filename, text, 'utf8');
+}
+
+// Artificial documents exercise the pipeline only, never serve as shipped model data.
+function fixtureCorpus(directory) {
+  const letters = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
+  for (let index = 0; index < letters.length; index++) {
+    const letter = letters[index];
+    write(directory, letter + '.tex', String.raw`\begin{enumerate}
+\item $\frac{x+y}{z}$ and $\frac{x+y}{w}$.
+$\sum_{i=1}^{n} x_i$ followed by $\sum_{i=1}^{n} y_i$.
+\item $${letter}_1 + ${letter}_2 = ${index + 2}$.
+$${letter}_1 + ${letter}_2 = ${index + 2}$.
+$\mathcal{${letter}}^{${index + 1}} = \left(${letter}^2 + ${index + 7}\right)$.
+$\partial ${letter} / \partial t = ${index + 9}${letter} + ${index + 3}$.
+\end{enumerate}`);
+  }
+}
+
+test('training CLI rejects ambiguous or invalid arguments', () => {
+  assert.equal(Training.parseArguments(['--help']).help, true);
+  assert.throws(() => Training.parseArguments([]), /--input/);
+  assert.throws(() => Training.parseArguments(['--unknown']), /Unknown/);
+  assert.throws(() => Training.parseArguments(['--input', 'data', '--output', 'model.js']), /\.json/);
+  assert.throws(() => Training.parseArguments(['--input', 'data', '--output', 'model.json', '--order', '6']), /between 1 and 5/);
+  assert.throws(() => Training.parseArguments(['--input', 'data', '--output', 'model.json', '--epochs', 'NaN']), /integer/);
+  assert.throws(() => Training.parseArguments(['--input', 'data', '--output', 'model.json', '--prepare', '--browser-output', 'model.js']), /cannot/);
+});
+
+test('corpus extraction excludes prose, comments, literals and prose commands inside math', (t) => {
+  const directory = temporary(t);
+  write(directory, 'one.tex', String.raw`PROSESECRET
+% $COMMENTSECRET$
+\begin{verbatim}$LITERALSECRET$\end{verbatim}
+$x + \text{TEXTSECRET} y$
+\[\frac{a}{b}\]`);
+  write(directory, 'plain.tex', 'No mathematics here.');
+  const corpus = Training.loadCorpus(directory, Training.DEFAULTS);
+  assert.equal(corpus.documents.length, 1);
+  assert.equal(corpus.emptyDocuments, 1);
+  const values = corpus.documents[0].segments.map((segment) => segment.text).join('');
+  assert.doesNotMatch(values, /SECRET|\\text/);
+  assert.match(values, /\\frac/);
+});
+
+test('exact duplicates, near duplicates and project families never cross splits', (t) => {
+  const directory = temporary(t);
+  fixtureCorpus(directory);
+  const original = fs.readFileSync(path.join(directory, 'a.tex'), 'utf8');
+  write(directory, 'copy.tex', original.replaceAll(' ', '  ') + '\n% another paper version');
+  const long = '$' + Array.from({ length: 80 }, (_, i) => 'v_{' + i + '}').join('+') + '$';
+  write(directory, 'family/first.tex', long);
+  write(directory, 'family/second.tex', '$unique = 517$');
+  write(directory, 'near.tex', long.replace('v_{79}', 'w_{79}'));
+  const corpus = Training.loadCorpus(directory, Training.DEFAULTS);
+  assert.equal(corpus.duplicateDocuments, 1);
+  const grouped = Training.splitCorpus(corpus, 42);
+  const familySplits = [];
+  for (const [name, documents] of Object.entries(grouped.splits)) {
+    for (const document of documents) if (document.relative.startsWith('family/') || document.relative === 'near.tex') familySplits.push(name);
+  }
+  assert.equal(new Set(familySplits).size, 1);
+  assert.equal(familySplits.length, 3);
+  const repeat = Training.splitCorpus(corpus, 42);
+  assert.deepEqual(Object.values(grouped.splits).map((docs) => docs.map((doc) => doc.mathHash)),
+    Object.values(repeat.splits).map((docs) => docs.map((doc) => doc.mathHash)));
+});
+
+test('training refuses insufficient independent families', (t) => {
+  const directory = temporary(t);
+  for (let i = 0; i < 5; i++) write(directory, 'one-project/' + i + '.tex', '$x=' + i + '$');
+  assert.throws(() => Training.splitCorpus(Training.loadCorpus(directory, Training.DEFAULTS), 1), /at least 4 distinct/);
+});
+
+test('L2 logistic ranker learns from features and handles constant dimensions', () => {
+  const vector = (first) => Predictor.FEATURE_NAMES.map((_, i) => i === 0 ? first : 0);
+  const examples = Array.from({ length: 20 }, () => ({ rows: [
+    { features: vector(2), label: 1, chars: 10, scopeTier: 0 },
+    { features: vector(-2), label: 0, chars: 10, scopeTier: 0 }
+  ] }));
+  const { ranker } = Training.trainRanker(examples, { ...Training.DEFAULTS, epochs: 25 });
+  assert.ok(Training.probability(examples[0].rows[0], ranker) > 0.9);
+  assert.ok(Training.probability(examples[0].rows[1], ranker) < 0.1);
+  assert.ok(ranker.scales.every((value) => value > 0 && Number.isFinite(value)));
+  assert.throws(() => Training.trainRanker([{ rows: [examples[0].rows[0]] }], Training.DEFAULTS), /both matching and non-matching/);
+});
+
+test('simulated typing never passes hidden or future source to candidate generation', (t) => {
+  const directory = temporary(t);
+  const text = String.raw`\item $\frac{x+y}{z}$ Later $FUTURESECRET$`;
+  write(directory, 'one.tex', text);
+  const corpus = Training.loadCorpus(directory, Training.DEFAULTS);
+  const calls = [];
+  const engine = { collectCandidates(visible, cursor) {
+    calls.push({ visible, cursor });
+    assert.equal(visible.length, cursor);
+    assert.equal(visible, text.slice(0, cursor));
+    return { candidates: [], context: { prefix: visible } };
+  } };
+  Training.generateExamples(corpus.documents, null, { ...Training.DEFAULTS, maxSamples: 1000 }, engine);
+  assert.ok(calls.length > 5);
+  assert.ok(calls.some((call) => call.visible.endsWith('\\fr')), 'sample cursors inside control words');
+  assert.ok(calls.filter((call) => call.cursor < text.indexOf('Later')).every((call) => !call.visible.includes('FUTURE')));
+  assert.ok(calls.every((call) => call.cursor < text.length));
+});
+
+test('completion labels preserve command boundaries and reconstruct partial commands', () => {
+  assert.equal(Training.candidateMatches('', '\\sin x', '\\sinx'), false);
+  assert.equal(Training.candidateMatches('', '\\sinx', '\\sin x'), false);
+  assert.equal(Training.candidateMatches('\\si', 'n x', 'n x + y'), true);
+  assert.equal(Training.candidateMatches('\\si', 'nx', 'n x + y'), false);
+  assert.equal(Training.candidateMatches('\\fra', 'c{x}{y}', 'c{ x }{ y } + z'), true);
+  assert.equal(Training.candidateMatches('x', ' + y', '+y+z'), true);
+});
+
+test('prepare and train produce reproducible validated artifacts without copying source documents', (t) => {
+  const directory = temporary(t);
+  const input = path.join(directory, 'data');
+  fixtureCorpus(input);
+  const options = { ...Training.DEFAULTS, input, output: path.join(directory, 'model.json'),
+    browserOutput: path.join(directory, 'model.js'), minCount: 1, maxSamples: 150, epochs: 4 };
+  const prepared = Training.train({ ...options, prepare: true, output: path.join(directory, 'prepared.json'), browserOutput: undefined });
+  assert.equal(prepared.preparation.documents, 8);
+  assert.equal(prepared.artifact, undefined);
+  const generationArtifacts = [];
+  const first = Training.train(options, { generateExamples(documents, artifact, settings) {
+    generationArtifacts.push(artifact);
+    return Training.generateExamples(documents, artifact, settings);
+  } });
+  assert.deepEqual(generationArtifacts.map((artifact) => artifact.trained), [false, true, true],
+    'validation and test shortlists use the fitted deployment ranker');
+  assert.deepEqual(generationArtifacts[1].ranker, first.artifact.ranker);
+  assert.deepEqual(generationArtifacts[2].ranker, first.artifact.ranker);
+  assert.equal(first.artifact.trained, true);
+  assert.equal(Predictor.validateArtifact(first.artifact), true);
+  assert.ok(first.report.ranker.positives > 0);
+  assert.ok(first.report.ranker.negatives > 0);
+  assert.ok(first.report.test.sampledCursors > 0);
+  const output = fs.readFileSync(options.output, 'utf8');
+  assert.equal(first.report.serializedModelBytes, Buffer.byteLength(output, 'utf8'));
+  const heldOut = Training.splitCorpus(Training.loadCorpus(input, options), options.seed).splits.test;
+  const deployedSamples = Training.generateExamples(heldOut, first.artifact, options);
+  assert.deepEqual(first.report.test,
+    Training.evaluate(deployedSamples, first.artifact.ranker, first.report.recommendedThreshold),
+    'held-out report matches candidate generation with the exported model');
+  Training.train(options);
+  assert.equal(fs.readFileSync(options.output, 'utf8'), output);
+  const sandbox = { module: { exports: {} } };
+  vm.runInNewContext(fs.readFileSync(options.browserOutput, 'utf8'), sandbox);
+  assert.equal(sandbox.AutoTexModel.trained, true);
+  assert.equal(sandbox.module.exports, sandbox.AutoTexModel);
+  assert.doesNotMatch(JSON.stringify(first.report), /\\begin|\\frac|\\sum/);
+  assert.equal(first.report.corpus.splits.test.documents, 1);
+});

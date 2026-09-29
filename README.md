@@ -1,6 +1,8 @@
 # AutoTeX
 
-A Chrome extension that offers grey inline LaTeX completions in Overleaf’s **Code Editor**. Press **Tab** to accept or **Esc** to dismiss. Suggestions are computed locally from the currently open file; no account, API key, or server is needed.
+A Chrome extension that offers grey inline LaTeX completions in Overleaf’s **Code Editor**. Press **Tab** to accept or **Esc** to dismiss. Suggestions activate only in mathematical regions and strongly prefer the current `\item` answer. Computation stays local; no account, API key, or server is needed.
+
+Version 1.2 includes a bounded 5-gram predictor, document adaptation, and an offline logistic-ranker training pipeline. The bundled model is explicitly **untrained**, ready for your LaTeX dataset. Document-based suggestions already work; corpus-trained predictions become available after exporting a trained model.
 
 ## Install
 
@@ -39,14 +41,27 @@ Suggestions first appear after a short typing pause. As you type matching charac
 ## What it recognizes
 
 - **Repeated expressions:** matches the typed prefix against formulas and subexpressions elsewhere in the current file. It recognizes `$...$`, `$$...$$`, `\(...\)`, `\[...\]`, and common equation/alignment environments. At least three non-whitespace prefix characters are normally required.
+- **Predictive continuations:** uses short LaTeX token contexts and notation from the open file. Candidate generation has a four-path beam and a twelve-token limit. The same tokenizer and candidate providers are used for offline model training. The popup's **Suggest math expressions** switch controls both reuse and prediction.
+- **Answer scope:** the current `\item` is the span until the next sibling item or the end of its list. Its formulas and token transitions take priority. Nested items have separate scopes and can fall back to their parent, then other answers. This preference is enforced independently of learned ranking weights. Standard `enumerate`, `itemize`, and `description` lists, their starred variants, and bare `\item` fragments are recognized; arbitrary macro-generated lists are not expanded.
 - **Indexed sequences:** recognizes consecutive numeric indices, preserves comma spacing and index braces, and completes an abbreviated list using `\ldots`. It first looks for an endpoint in a matching list or a nearby bound for the same variable, then uses the popup’s default (`n`). A default number from 3 to 999 may be set explicitly.
 - **Safe editing:** previews are native CodeMirror decorations, not temporary document edits. Acceptance uses one editor transaction and preserves standard editing/undo behavior. Suggestions stop for read-only documents, multiple selections, and input-method composition.
 
-Comments, common verbatim/listing environments, and text inside math `\text{...}` commands are excluded. These are deterministic pattern suggestions, not a mathematical reasoning system: they do not prove that a copied formula is appropriate or infer every intended sequence. Review the preview before accepting it. Lists use ellipsis notation rather than expanding every intervening index.
+Comments, common verbatim/listing environments, text inside math `\text{...}` commands, and label/reference arguments are excluded. Predictions estimate likely notation; they do not prove that an expression is mathematically appropriate. Review the preview before accepting it. Lists use ellipsis notation rather than expanding every intervening index. Generative suggestions currently fill the end of an expression or an automatically paired group; expression reuse can also fill known gaps before existing text.
+
+## Prepare and train a model
+
+See [the training guide](docs/TRAINING.md) for dataset layout, split isolation, training controls, and evaluation limits. Use local `.tex` files, with each independent project in its own top-level folder. Training requires at least four distinct document families after grouping; that minimum only verifies the pipeline, so a useful model needs a larger representative dataset.
+
+```powershell
+npm run model:prepare -- --input "C:\path\to\dataset" --output "artifacts\prepared.json"
+npm run model:train -- --input "C:\path\to\dataset" --output "artifacts\model.json"
+```
+
+The preparation command validates mathematical extraction and writes split metadata. Training creates token counts, ranking weights, and a held-out evaluation report. Add `--browser-output "extension\model.js"` to the training command when ready to install the trained artifact, then reload the extension and Overleaf. The trainer uses Node.js with no additional dependencies and never compiles or executes the LaTeX. Dataset and generated-artifact folders are ignored by Git.
 
 ## Scope and privacy
 
-Only the source text of the currently open editor file is available. Other project files and the PDF are not read. The extension does not persist document text, make network requests, use analytics, or require a remote model. Chrome’s local extension storage holds only preferences. Overleaf’s normal saving and collaboration continue to operate independently.
+Only the source text of the currently open editor file is available at runtime. Other project files and the PDF are not read. The extension does not persist document text, make network requests, use analytics, or require a remote model. Chrome’s local extension storage holds only preferences. Optional offline corpus training reads only the dataset folder you explicitly supply. Overleaf’s normal saving and collaboration continue to operate independently.
 
 This version targets `https://www.overleaf.com/project/*` and `https://overleaf.com/project/*`. The Visual Editor, older Ace editors, custom/self-hosted Overleaf domains, and specialized Vim/Emacs interactions are outside the verified scope. This is an unofficial extension and is not affiliated with Overleaf.
 
@@ -66,6 +81,7 @@ Node.js 22+ and npm (or pnpm) are needed only for development:
 npm install
 npm test
 npm run test:browser
+npm run benchmark
 npm run package
 ```
 
@@ -73,7 +89,9 @@ The browser suite uses real CodeMirror modules and reproduces Overleaf’s third
 
 The release ZIP is written to `dist/autotex.zip`. All runtime scripts are plain JavaScript; development libraries are never shipped. `tests/.generated/` and `test-results/` contain only local test output.
 
-The automated checks cover expression and sequence matching, cursor/overlap edge cases, grey decorations, continuous typing with spaces and automatic brackets, acceptance, independent Undo, dismissal, document switching, settings, selection, read-only mode, and composition. A signed-in live Overleaf project has not been tested in this workspace.
+The automated checks cover math-only gating, nested item priority, token boundaries, model validation, training leakage/determinism, expression and sequence matching, cursor/overlap edge cases, grey decorations, continuous typing with spaces and automatic brackets, acceptance, independent Undo, dismissal, document switching, settings, selection, read-only mode, and composition. Training tests use temporary artificial fixtures, which are not shipped as a trained model. A signed-in live Overleaf project has not been tested in this workspace.
+
+The benchmark measures complete engine calls on changed documents of several sizes, with the installed model. It excludes browser rendering and the default 50 ms scheduling delay, and is not a guarantee of end-to-end latency. Matching an existing ghost does not rerun prediction. Candidate work is bounded to 128 nearby mathematical rows, prioritized by item; parser updates currently reanalyze changed documents, so very large files still need profiling before distribution.
 
 ## Integration references
 
