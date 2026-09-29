@@ -1,27 +1,54 @@
 {
   "manifest_version": 3,
-  "name": "Math Autocomplete for Overleaf",
-  "version": "1.0.0",
-  "description": "Reuse math expressions and complete indexed sequences in Overleaf with inline suggestions. Unofficial, private, and local.",
+  "name": "AutoTeX",
+  "version": "1.3.0",
+  "description": "Local mathematical completions for Overleaf, prioritizing the current answer. Grey previews and Tab acceptance. Unofficial.",
   "minimum_chrome_version": "111",
-  "permissions": ["storage"],
-  "icons": { "16": "icon16.png", "32": "icon32.png", "48": "icon48.png", "128": "icon128.png" },
+  "permissions": [
+    "storage"
+  ],
+  "icons": {
+    "16": "extension/icon16.png",
+    "32": "extension/icon32.png",
+    "48": "extension/icon48.png",
+    "128": "extension/icon128.png"
+  },
   "action": {
-    "default_icon": { "16": "icon16.png", "32": "icon32.png" },
-    "default_title": "Math Autocomplete for Overleaf",
-    "default_popup": "popup.html"
+    "default_icon": {
+      "16": "extension/icon16.png",
+      "32": "extension/icon32.png"
+    },
+    "default_title": "AutoTeX",
+    "default_popup": "extension/popup.html"
   },
   "content_scripts": [
     {
-      "matches": ["https://www.overleaf.com/project/*", "https://overleaf.com/project/*"],
-      "js": ["engine.js", "editor.js"],
+      "matches": [
+        "https://www.overleaf.com/project/*",
+        "https://overleaf.com/project/*"
+      ],
+      "js": [
+        "extension/context.js",
+        "extension/classifier.js",
+        "extension/predictor.js",
+        "extension/model.js",
+        "extension/engine.js",
+        "extension/editor.js"
+      ],
       "run_at": "document_idle",
       "world": "MAIN"
     },
     {
-      "matches": ["https://www.overleaf.com/project/*", "https://overleaf.com/project/*"],
-      "js": ["bridge.js"],
-      "css": ["editor.css"],
+      "matches": [
+        "https://www.overleaf.com/project/*",
+        "https://overleaf.com/project/*"
+      ],
+      "js": [
+        "extension/bridge.js"
+      ],
+      "css": [
+        "extension/editor.css"
+      ],
       "run_at": "document_idle",
       "world": "ISOLATED"
     }

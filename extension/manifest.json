@@ -1,27 +1,54 @@
 {
   "manifest_version": 3,
   "name": "AutoTeX",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Local mathematical completions for Overleaf, prioritizing the current answer. Grey previews and Tab acceptance. Unofficial.",
   "minimum_chrome_version": "111",
-  "permissions": ["storage"],
-  "icons": { "16": "icon16.png", "32": "icon32.png", "48": "icon48.png", "128": "icon128.png" },
+  "permissions": [
+    "storage"
+  ],
+  "icons": {
+    "16": "icon16.png",
+    "32": "icon32.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  },
   "action": {
-    "default_icon": { "16": "icon16.png", "32": "icon32.png" },
+    "default_icon": {
+      "16": "icon16.png",
+      "32": "icon32.png"
+    },
     "default_title": "AutoTeX",
     "default_popup": "popup.html"
   },
   "content_scripts": [
     {
-      "matches": ["https://www.overleaf.com/project/*", "https://overleaf.com/project/*"],
-      "js": ["context.js", "predictor.js", "model.js", "engine.js", "editor.js"],
+      "matches": [
+        "https://www.overleaf.com/project/*",
+        "https://overleaf.com/project/*"
+      ],
+      "js": [
+        "context.js",
+        "classifier.js",
+        "predictor.js",
+        "model.js",
+        "engine.js",
+        "editor.js"
+      ],
       "run_at": "document_idle",
       "world": "MAIN"
     },
     {
-      "matches": ["https://www.overleaf.com/project/*", "https://overleaf.com/project/*"],
-      "js": ["bridge.js"],
-      "css": ["editor.css"],
+      "matches": [
+        "https://www.overleaf.com/project/*",
+        "https://overleaf.com/project/*"
+      ],
+      "js": [
+        "bridge.js"
+      ],
+      "css": [
+        "editor.css"
+      ],
       "run_at": "document_idle",
       "world": "ISOLATED"
     }

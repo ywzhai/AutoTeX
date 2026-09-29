@@ -696,3 +696,36 @@ test("an invalid installed model falls back to document completions", async (t) 
 });
 
 
+
+
+test("classified subscript preview accepts with Tab and preserves the paired brace", async (t) => {
+  const page = await fixture(t);
+  const before = await setDocument(page, "$x_{j,k}$\n$x_{|}$");
+  assert.equal(await ghostText(page), "j,k");
+  assert.equal(await documentText(page), before);
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), "$x_{j,k}$\n$x_{j,k}$");
+  await page.keyboard.press("Control+z");
+  assert.equal(await documentText(page), before);
+});
+
+test("a trained low-confidence ranker retains reliable grey expression previews", async (t) => {
+  const Predictor = require("../extension/predictor.js");
+  const model = { ...Predictor.createUntrainedArtifact(), trained: true,
+    ranker: { features: [...Predictor.FEATURE_NAMES], weights: Predictor.FEATURE_NAMES.map(() => 0),
+      means: Predictor.FEATURE_NAMES.map(() => 0), scales: Predictor.FEATURE_NAMES.map(() => 1), bias: -30 },
+    training: { recommendedThreshold: 0.99 } };
+  const page = await fixture(t, { modelArtifact: model });
+  await setDocument(page, "$f(x)=x^2+1$\n$f(x)|$");
+  assert.equal(await ghostText(page), "=x^2+1");
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), "$f(x)=x^2+1$\n$f(x)=x^2+1$");
+});
+
+test("local set declarations guide ambiguous relation reuse in the browser", async (t) => {
+  const page = await fixture(t);
+  await setDocument(page, "\\begin{enumerate}\\item Let $A$ be a set. $A \\subseteq B$ and $A \\sin x$. $A \\s|$\\end{enumerate}");
+  assert.equal(await ghostText(page), "ubseteq B");
+  await page.keyboard.press("Tab");
+  assert.match(await documentText(page), /\$A \\subseteq B\$\s*\\end/);
+});

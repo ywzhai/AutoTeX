@@ -1,19 +1,22 @@
 (function (root, factory) {
-  const api = factory();
+  const commonJS = typeof module === "object" && module.exports;
+  const api = factory(commonJS ? require("./classifier.js") : root.AutoTexClassifier);
   if (typeof module === "object" && module.exports) module.exports = api;
   root.AutoTexPredictor = api;
-})(typeof globalThis !== "undefined" ? globalThis : this, function () {
+})(typeof globalThis !== "undefined" ? globalThis : this, function (Classifier) {
   "use strict";
 
   const TOKENIZER_VERSION = "autotex-tex-v1";
+  const SCHEMA_VERSION = 2;
+  const CLASSIFIER_VERSION = "autotex-context-v1";
   const END_TOKEN = "<eos>";
   const FEATURE_NAMES = Object.freeze([
     "ngramLogProbability", "documentEvidence", "sameItemEvidence", "ancestorEvidence",
     "observedSymbolRatio", "prefixTokenCount", "tokenCount", "charCount", "sourceDistance",
     "sourceExpression", "sourceSequence", "sourceGrammar", "sourcePrediction",
-    "balanced", "endsAtBoundary",
+    "balanced", "endsAtBoundary", "categoryMatch", "indexFit", "symbolTypeMatch",
   ]);
-  const BASELINE_WEIGHTS = Object.freeze([0.7, 0.3, 0.7, 0.4, 1, 0.3, 0.8, 0.6, 0.4, 1.1, 1, 0.7, 0, 1, 0.8]);
+  const BASELINE_WEIGHTS = Object.freeze([0.7, 0.3, 0.7, 0.4, 1, 0.3, 0.8, 0.6, 0.4, 1.1, 1, 0.7, 0, 1, 0.8, 1.2, 2, 1.2]);
   const EMPTY_SEGMENTS = Object.freeze([]);
   const KNOWN_COMMANDS = new Set((
     "frac dfrac tfrac cfrac binom dbinom tbinom sqrt sum prod coprod int iint iiint oint lim limsup liminf " +
@@ -29,7 +32,8 @@
     "ldots cdots dots vdots ddots overline underline bar hat widehat tilde widetilde vec dot ddot " +
     "mathbf mathbb mathcal mathfrak mathrm mathit mathsf mathtt boldsymbol bm operatorname text " +
     "overbrace underbrace overset underset stackrel quad qquad thinspace medspace thickspace " +
-    "sin cos degree angle triangle square choose at atop"
+    "sin cos degree angle triangle square choose at atop not mid nmid gcd lcm " +
+    "bigcup bigcap bigsqcup biguplus bigvee bigwedge dotsc dotsb dotsm"
   ).split(/\s+/).map((name) => "\\" + name));
   const BLOCKED_COMMANDS = new Set([
     "\\input", "\\include", "\\write", "\\openout", "\\read", "\\def", "\\gdef", "\\edef",
@@ -43,7 +47,7 @@
     ["\\mathbf", 1], ["\\mathbb", 1], ["\\mathcal", 1], ["\\mathfrak", 1],
     ["\\mathrm", 1], ["\\mathit", 1], ["\\mathsf", 1], ["\\mathtt", 1],
     ["\\boldsymbol", 1], ["\\bm", 1], ["\\overline", 1], ["\\underline", 1],
-    ["\\bar", 1], ["\\hat", 1], ["\\tilde", 1], ["\\vec", 1],
+    ["\\bar", 1], ["\\hat", 1], ["\\tilde", 1], ["\\vec", 1], ["\\not", 1],
   ]);
   const clamp = (value, low, high) => Math.min(high, Math.max(low, value));
   const finite = (value, fallback = 0) => Number.isFinite(value) ? value : fallback;
@@ -166,9 +170,14 @@
   }
 
   function validateArtifact(artifact) {
-    if (!artifact || artifact.schemaVersion !== 1 || typeof artifact.trained !== "boolean" ||
-        artifact.tokenizerVersion !== TOKENIZER_VERSION ||
-        !(artifact.ngrams == null && !artifact.trained) && !validNgrams(artifact.ngrams)) return false;
+    if (!artifact || typeof artifact.trained !== "boolean" ||
+        artifact.tokenizerVersion !== TOKENIZER_VERSION) return false;
+    // Only the untrained v1 format can migrate without retraining. A trained
+    // v1 ranker has a different feature layout and must never be silently reused.
+    const legacyUntrained = artifact.schemaVersion === 1 && !artifact.trained && artifact.ranker == null;
+    if (!legacyUntrained && (artifact.schemaVersion !== SCHEMA_VERSION ||
+        artifact.classifierVersion !== CLASSIFIER_VERSION)) return false;
+    if (!(artifact.ngrams == null && !artifact.trained) && !validNgrams(artifact.ngrams)) return false;
     const ranker = artifact.ranker;
     if (ranker == null) return artifact.trained === false;
     if (!Array.isArray(ranker.features) || ranker.features.length !== FEATURE_NAMES.length ||
@@ -183,7 +192,8 @@
   }
 
   function createUntrainedArtifact(ngrams = buildNgrams([])) {
-    return { schemaVersion: 1, trained: false, tokenizerVersion: TOKENIZER_VERSION, ngrams, ranker: null };
+    return { schemaVersion: SCHEMA_VERSION, trained: false, tokenizerVersion: TOKENIZER_VERSION,
+      classifierVersion: CLASSIFIER_VERSION, ngrams, ranker: null };
   }
 
   function indexModel(model) {
@@ -287,7 +297,13 @@
     return commandsHaveArguments(suffixTokens.map((token) => token.value));
   }
 
+  function classifiedContext(context) {
+    if (context.classification || !Classifier?.analyze) return context;
+    return { ...context, classification: Classifier.analyze(context) };
+  }
+
   function featureValues(candidate, context = {}) {
+    context = classifiedContext(context);
     const fullText = candidate.fullText ?? candidate.insertText ?? "";
     const tokens = tokenize(fullText).filter((token) => token.value !== " " && token.value !== "\n");
     const observed = context.observedTokens instanceof Set ? context.observedTokens : knownTokens(context);
@@ -311,7 +327,13 @@
       balanced: braceBalance((context.prefix || "") + fullText) === 0 ? 1 : 0,
       endsAtBoundary: candidate.endsAtBoundary ? 1 : 0,
     };
-    return FEATURE_NAMES.map((name) => finite(candidate.features?.[name], values[name]));
+    // Contextual features must be refreshed when a candidate is reranked after
+    // the cursor moves; previous rank() output is not current evidence.
+    const semantic = Classifier?.candidateFeatures ? Classifier.candidateFeatures(candidate, context) : {};
+    for (const name of ["categoryMatch", "indexFit", "symbolTypeMatch"]) {
+      values[name] = clamp(finite(semantic[name]), -1, 1);
+    }
+    return FEATURE_NAMES.map((name, index) => index >= 15 ? values[name] : finite(candidate.features?.[name], values[name]));
   }
 
   function trimRightOverlap(text, right) {
@@ -375,7 +397,7 @@
 
     function rank(candidates, context = {}) {
       if (!Array.isArray(candidates)) return [];
-      const observedContext = { ...context, observedTokens: context.observedTokens || knownTokens(context) };
+      const observedContext = classifiedContext({ ...context, observedTokens: context.observedTokens || knownTokens(context) });
       const model = valid && artifact.trained ? artifact.ranker : null;
       return candidates.filter((candidate) => candidate && typeof candidate.insertText === "string").map((candidate) => {
         const values = featureValues(candidate, observedContext);
@@ -396,6 +418,7 @@
 
     function candidates(context = {}) {
       if (!valid || typeof context.prefix !== "string" || !context.prefix.trim()) return [];
+      context = classifiedContext(context);
       const prefix = context.prefix;
       const right = typeof context.right === "string" ? context.right : "";
       const maxTokens = clamp(Math.trunc(finite(context.maxTokens, 12)), 1, 32);
@@ -419,6 +442,8 @@
         if (!distributions.some((entry) => entry.longest > 0) && !(beam.partial && beam.history.length === 0)) return [];
         const tokens = new Set(distributions.flatMap((entry) => [...entry.probabilities.keys()]));
         const options = [];
+        const historyText = prefix + beam.suffix;
+        let totalProbability = 0;
         for (const token of tokens) {
           if (token === "\n" || token === "\\\\" || token === "\\" || token === "%" || mathDelimiter(token) ||
               (beam.partial && (!token.startsWith(beam.partial) || token === beam.partial))) continue;
@@ -436,8 +461,17 @@
             }
           }
           probability /= mass || 1;
-          if (probability > 0) options.push({ token, probability, tier: level, support });
+          // A bounded soft preference guides the beam without forbidding mixed
+          // operations such as intersections of groups or sets of scalars.
+          if (Classifier?.tokenWeight && token !== END_TOKEN && token !== " ") {
+            probability *= clamp(finite(Classifier.tokenWeight(token, historyText, context.classification), 1), 0.5, 2);
+          }
+          if (probability > 0) {
+            totalProbability += probability;
+            options.push({ token, probability, tier: level, support });
+          }
         }
+        for (const option of options) option.probability /= totalProbability || 1;
         return options.sort((a, b) => b.tier - a.tier || b.probability - a.probability ||
           a.token.localeCompare(b.token)).slice(0, 6);
       }
@@ -503,7 +537,7 @@
   }
 
   return {
-    TOKENIZER_VERSION, tokenizerVersion: TOKENIZER_VERSION, END_TOKEN,
+    TOKENIZER_VERSION, tokenizerVersion: TOKENIZER_VERSION, SCHEMA_VERSION, CLASSIFIER_VERSION, END_TOKEN,
     FEATURE_NAMES, featureNames: FEATURE_NAMES, tokenize, buildNgrams,
     validateArtifact, createUntrainedArtifact, validateCandidate, featureValues, createPredictor,
   };

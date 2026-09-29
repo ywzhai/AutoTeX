@@ -2,7 +2,7 @@
 
 A Chrome extension that offers grey inline LaTeX completions in Overleaf’s **Code Editor**. Press **Tab** to accept or **Esc** to dismiss. Suggestions activate only in mathematical regions and strongly prefer the current `\item` answer. Computation stays local; no account, API key, or server is needed.
 
-Version 1.2 includes a bounded 5-gram predictor, document adaptation, and an offline logistic-ranker training pipeline. The bundled model is explicitly **untrained**, ready for your LaTeX dataset. Document-based suggestions already work; corpus-trained predictions become available after exporting a trained model.
+Version 1.3 adds a lightweight expression classifier for sets, algebraic structures, functions, scalar expressions, and indices. It guides document retrieval and a bounded 5-gram predictor using local symbol declarations and syntax. The classifier runs immediately without training; the bundled corpus model remains explicitly **untrained**. Offline training learns ranking weights, including type compatibility.
 
 ## Install
 
@@ -42,11 +42,15 @@ Suggestions first appear after a short typing pause. As you type matching charac
 
 - **Repeated expressions:** matches the typed prefix against formulas and subexpressions elsewhere in the current file. It recognizes `$...$`, `$$...$$`, `\(...\)`, `\[...\]`, and common equation/alignment environments. At least three non-whitespace prefix characters are normally required.
 - **Predictive continuations:** uses short LaTeX token contexts and notation from the open file. Candidate generation has a four-path beam and a twelve-token limit. The same tokenizer and candidate providers are used for offline model training. The popup's **Suggest math expressions** switch controls both reuse and prediction.
+- **Expression types:** standard number sets such as `\mathbb{R}` and local declarations such as `Let $G$ be a group` provide type evidence. A bare `R`, `N`, or `G` stays uncertain. Type compatibility softly adjusts suggestions; groups can still participate in set relations. Classification reads bounded context before the cursor, with current-item evidence taking priority.
+- **Indices:** an unfinished subscript such as `x_{` activates index context. The engine can reuse an index already observed on the same base symbol, including `x_{j,k}` and `x_{i+1}`, preserving existing closing braces. Summation bounds and escaped underscores are distinguished from ordinary subscripts.
 - **Answer scope:** the current `\item` is the span until the next sibling item or the end of its list. Its formulas and token transitions take priority. Nested items have separate scopes and can fall back to their parent, then other answers. This preference is enforced independently of learned ranking weights. Standard `enumerate`, `itemize`, and `description` lists, their starred variants, and bare `\item` fragments are recognized; arbitrary macro-generated lists are not expanded.
 - **Indexed sequences:** recognizes consecutive numeric indices, preserves comma spacing and index braces, and completes an abbreviated list using `\ldots`. It first looks for an endpoint in a matching list or a nearby bound for the same variable, then uses the popup’s default (`n`). A default number from 3 to 999 may be set explicitly.
 - **Safe editing:** previews are native CodeMirror decorations, not temporary document edits. Acceptance uses one editor transaction and preserves standard editing/undo behavior. Suggestions stop for read-only documents, multiple selections, and input-method composition.
 
 Comments, common verbatim/listing environments, text inside math `\text{...}` commands, and label/reference arguments are excluded. Predictions estimate likely notation; they do not prove that an expression is mathematically appropriate. Review the preview before accepting it. Lists use ellipsis notation rather than expanding every intervening index. Generative suggestions currently fill the end of an expression or an automatically paired group; expression reuse can also fill known gaps before existing text.
+
+Document-supported expression, sequence, and index reuse remains available even when a trained model rejects its generated predictions. The learned confidence threshold applies to generated suggestions.
 
 ## Prepare and train a model
 
@@ -57,7 +61,7 @@ npm run model:prepare -- --input "C:\path\to\dataset" --output "artifacts\prepar
 npm run model:train -- --input "C:\path\to\dataset" --output "artifacts\model.json"
 ```
 
-The preparation command validates mathematical extraction and writes split metadata. Training creates token counts, ranking weights, and a held-out evaluation report. Add `--browser-output "extension\model.js"` to the training command when ready to install the trained artifact, then reload the extension and Overleaf. The trainer uses Node.js with no additional dependencies and never compiles or executes the LaTeX. Dataset and generated-artifact folders are ignored by Git.
+The preparation command validates mathematical extraction and writes split metadata. Training creates token counts, 18-feature ranking weights, and a held-out evaluation report broken down by expression category and completion source. Add `--browser-output "extension\model.js"` to the training command when ready to install the trained artifact, then reload the extension and Overleaf. The trainer uses Node.js with no additional dependencies and never compiles or executes the LaTeX. Dataset and generated-artifact folders are ignored by Git.
 
 ## Scope and privacy
 
@@ -91,7 +95,7 @@ The release ZIP is written to `dist/autotex.zip`. All runtime scripts are plain 
 
 The automated checks cover math-only gating, nested item priority, token boundaries, model validation, training leakage/determinism, expression and sequence matching, cursor/overlap edge cases, grey decorations, continuous typing with spaces and automatic brackets, acceptance, independent Undo, dismissal, document switching, settings, selection, read-only mode, and composition. Training tests use temporary artificial fixtures, which are not shipped as a trained model. A signed-in live Overleaf project has not been tested in this workspace.
 
-The benchmark measures complete engine calls on changed documents of several sizes, with the installed model. It excludes browser rendering and the default 50 ms scheduling delay, and is not a guarantee of end-to-end latency. Matching an existing ghost does not rerun prediction. Candidate work is bounded to 128 nearby mathematical rows, prioritized by item; parser updates currently reanalyze changed documents, so very large files still need profiling before distribution.
+The benchmark measures complete engine calls on changed documents of several sizes, with the installed model. It excludes browser rendering and the default 50 ms scheduling delay, and is not a guarantee of end-to-end latency. Matching an existing ghost does not rerun prediction. Classifier work is bounded to 24,000 characters, 128 math rows, and 128 symbols; candidate work uses 128 nearby mathematical rows prioritized by item; parser updates currently reanalyze changed documents, so very large files still need profiling before distribution.
 
 ## Integration references
 

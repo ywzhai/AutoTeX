@@ -289,3 +289,66 @@ test('masked prose does not turn a reused expression into a dangling operator su
   const result = suggest('$x+a+\\text{hello}+b$ $x+a|$');
   assert.notEqual(result?.insertText.trim(), '+');
 });
+
+
+test('learned confidence cannot suppress document-supported formulas and sequences', () => {
+  const Predictor = require('../extension/predictor.js');
+  const artifact = { ...Predictor.createUntrainedArtifact(), trained:true,
+    ranker: {features:[...Predictor.FEATURE_NAMES], weights:Predictor.FEATURE_NAMES.map(()=>0),
+      means:Predictor.FEATURE_NAMES.map(()=>0), scales:Predictor.FEATURE_NAMES.map(()=>1), bias:-30},
+    training:{recommendedThreshold:0.99} };
+  assert.equal(Predictor.validateArtifact(artifact), true);
+  for (const marked of ['$f(x)=x^2+1$ then $f(x)|$', '$\\{x_1,x_2|$']) {
+    assert.equal(suffix(marked, {model:artifact}), suffix(marked));
+  }
+});
+
+test('shared selection keeps item priority and applies confidence only to generated candidates', () => {
+  const {selectCandidate} = require('../extension/engine.js');
+  const reuse = {kind:'expression',itemTier:2,insertText:' + y',score:0.001,semanticScore:0,legacyScore:2};
+  const generated = {kind:'prediction',itemTier:2,insertText:' + z',score:0.9,semanticScore:0};
+  assert.equal(selectCandidate([generated,reuse],0.95), reuse);
+  assert.equal(selectCandidate([generated],0.95), null);
+  assert.equal(selectCandidate([generated],0.85), generated);
+  const otherItem = {...reuse,itemTier:0};
+  assert.equal(selectCandidate([otherItem,generated],0.85), generated);
+  assert.equal(selectCandidate([otherItem,generated],0.95), otherItem);
+});
+
+test('underscores reuse indices for the same base while respecting scope and braces', () => {
+  assert.equal(suffix('$a_{i+1}$ and $x_{j,k}$ then $x_{|}$'), 'j,k');
+  assert.equal(suffix('$x_{j,k}$ then $x_|$'), '{j,k}');
+  const local='\\begin{enumerate}\\item $x_{k-1}$\\item $x_{j+1}$ then $x_{j+|}$\\end{enumerate}';
+  assert.equal(suffix(local), '1');
+  assert.equal(suggest('$x_{j,k}$ then prose x_{|}'), null);
+});
+
+test('classification uses declarations from the current answer and excludes future declarations', () => {
+  const engine=createEngine();
+  const group='\\begin{enumerate}\\item Let $G$ be a set.\\item Let $G$ be a group. $G';
+  const context=engine.collectCandidates(group,group.length).context;
+  assert.equal(context.classification.kind,'algebra');
+  const before='$R';
+  const future=before+'$ Let $R$ be a group.';
+  assert.equal(engine.collectCandidates(future,before.length).context.classification.kind,'unknown');
+  assert.equal(engine.collectCandidates('ordinary prose R',16),null);
+});
+
+
+test('partial unbraced index commands cannot reuse a composite braced argument', () => {
+  for (const content of ['\\alpha+1','\\alpha_1']) {
+    const text='$x_{'+content+'}$ then $x_\\al';
+    const candidates=createEngine().collectCandidates(text,text.length).candidates;
+    assert.ok(!candidates.some((candidate)=>candidate.kind==='index'),
+      'a suffix cannot insert the missing opening brace before the typed command');
+  }
+  assert.equal(suffix('$x_{\\alpha}$ then $x_\\al|$'),'pha');
+});
+
+
+test('styled index bases share canonical parsing without conflating symbols', () => {
+  assert.equal(suffix('$\\mathbb{R}_{i+1}$ then $\\mathbb R_{|}$'),'i+1');
+  assert.equal(suffix('$\\mathbf{\\alpha}_{j,k}$ then $\\mathbf\\alpha_|$'),'{j,k}');
+  const text='$R_{m+1}$ then $\\mathbb R_{';
+  assert.ok(!createEngine().collectCandidates(text,text.length).candidates.some((candidate)=>candidate.kind==='index'));
+});

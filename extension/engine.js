@@ -1,12 +1,13 @@
 (function (root, factory) {
   const commonJS = typeof module === 'object' && module.exports;
   const Context = commonJS ? require('./context.js') : root.AutoTexContext;
+  const Classifier = commonJS ? require('./classifier.js') : root.AutoTexClassifier;
   const Predictor = commonJS ? require('./predictor.js') : root.AutoTexPredictor;
   const model = commonJS ? require('./model.js') : root.AutoTexModel;
-  const api = factory(Context, Predictor, model);
+  const api = factory(Context, Predictor, model, Classifier);
   if (typeof module === 'object' && module.exports) module.exports = api;
   root.MathAutocompleteEngine = api;
-})(typeof globalThis !== 'undefined' ? globalThis : this, function (Context, Predictor, bundledModel) {
+})(typeof globalThis !== 'undefined' ? globalThis : this, function (Context, Predictor, bundledModel, Classifier) {
   'use strict';
 
   const DEFAULT_SETTINGS = Object.freeze({
@@ -18,7 +19,7 @@
     sequenceEnd: 'n',
     debounceMs: 50
   });
-  const BASE_SOURCE = String.raw`(?:\\(?:mathrm|mathbf|mathit|mathsf|mathtt|boldsymbol|bm)\s*\{(?:\\[A-Za-z]+|[A-Za-z])\}|\\[A-Za-z]+|\{(?:\\[A-Za-z]+|[A-Za-z])\}|[A-Za-z])`;
+  const BASE_SOURCE = Classifier.SYMBOL_SOURCE;
   const TERM_SOURCE = '(' + BASE_SOURCE + ')' + String.raw`\s*_\s*(?:\{(\d+)\}|(\d+))`;
   const compact = (value) => value.replace(/\s+/g, '');
   const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -213,7 +214,7 @@
     return candidates;
   }
 
-  function expressionSuggestions(parsed, region, text, cursor, settings) {
+  function expressionSuggestions(parsed, region, text, cursor, settings, context) {
     const fragment = parsed.clean.slice(Math.max(region.start, cursor - settings.maxSuggestionLength), cursor);
     const row = fragment.split(/\\\\|\r?\n/).pop();
     if (!row.trim() || /\\(?:text|textrm|textit|textbf|mbox)\{[^}]*$/.test(row)) return [];
@@ -258,7 +259,9 @@
         }
       }
     }
-    return results.sort((a, b) => b.itemTier - a.itemTier || b.legacyScore - a.legacyScore).slice(0, 24);
+    return results.sort((a, b) => b.itemTier - a.itemTier || b.legacyScore - a.legacyScore).slice(0, 64)
+      .map((candidate) => semanticFeatures(candidate, context))
+      .sort((a, b) => b.itemTier - a.itemTier || b.semanticScore - a.semanticScore || b.legacyScore - a.legacyScore).slice(0, 24);
   }
 
   function balancedTail(prefix, suffix) {
@@ -282,6 +285,132 @@
     return suffix;
   }
 
+
+  function semanticFeatures(candidate, context) {
+    const features = Classifier.candidateFeatures(candidate, context);
+    candidate.features = { ...candidate.features, ...features };
+    candidate.semanticScore = (context.classification?.confidence || 0) *
+      (2 * features.categoryMatch + 3 * features.indexFit + 2 * features.symbolTypeMatch);
+    return candidate;
+  }
+
+  // The offline evaluator uses this same selection policy. Low corpus confidence
+  // must not disable a concrete completion already supported by the document.
+  function selectCandidate(ranked, threshold = 0) {
+    if (!Array.isArray(ranked) || !ranked.length) return null;
+    const tier = (candidate) => candidate.itemTier ?? candidate.scopeTier ?? 0;
+    const isReliable = (candidate) => candidate.reliable ||
+      candidate.kind === 'expression' || candidate.kind === 'sequence';
+    // Rejected predictions are not eligible to block a lower-scope reuse.
+    const eligible = ranked.filter((candidate) => isReliable(candidate) ||
+      (Number.isFinite(candidate.score) && candidate.score >= threshold));
+    if (!eligible.length) return null;
+    const bestTier = Math.max(...eligible.map(tier));
+    const scoped = eligible.filter((candidate) => tier(candidate) === bestTier);
+    const reliable = scoped.filter(isReliable);
+    reliable.sort((a, b) => (b.semanticScore || 0) - (a.semanticScore || 0) ||
+      Number(b.kind === 'sequence') - Number(a.kind === 'sequence') ||
+      (b.legacyScore || 0) - (a.legacyScore || 0) ||
+      (a.insertText || '').localeCompare(b.insertText || ''));
+    if (reliable.length) return reliable[0];
+    scoped.sort((a, b) => (b.score || 0) - (a.score || 0) ||
+      (b.insertText || '').length - (a.insertText || '').length ||
+      (a.insertText || '').localeCompare(b.insertText || ''));
+    return Number.isFinite(scoped[0]?.score) && scoped[0].score >= threshold ? scoped[0] : null;
+  }
+
+  function declarationContext(parsed, active, cursor) {
+    const declarations = [];
+    function add(start, end, tier, budget, ownerId) {
+      end = Math.min(end, cursor);
+      start = Math.max(start, end - budget);
+      if (end <= start) return;
+      const excluded = parsed.items.filter((item) => item.id !== ownerId &&
+        item.end > start && item.start < end &&
+        (ownerId == null || item.start >= parsed.items[ownerId - 1].contentStart)).map((item) => ({start:item.start,end:Math.min(end,item.end)}));
+      let position = start, text = '';
+      for (const range of excluded) {
+        if (range.start >= position) text += parsed.clean.slice(position, range.start);
+        position = Math.max(position, range.end);
+      }
+      text += parsed.clean.slice(position, end);
+      if (text.trim()) declarations.push({text, itemTier:tier});
+    }
+    if (active.item) {
+      add(active.item.contentStart, active.item.end, 2, 3500, active.item.id);
+      for (const id of active.ancestorIds.slice(0, 2)) {
+        const item = parsed.items[id - 1];
+        add(item.contentStart, item.end, 1, 1500, item.id);
+      }
+      add(0, parsed.items[0]?.start ?? cursor, 0, 1500, null);
+    } else {
+      add(0, cursor, 0, 5000, null);
+    }
+    return declarations;
+  }
+
+  function observedIndices(segment) {
+    const found = [];
+    const pattern = new RegExp('(' + BASE_SOURCE + ')' + '\\s*_\\s*', 'g');
+    let match;
+    while ((match = pattern.exec(segment.text))) {
+      if (escaped(segment.text, match.index)) continue;
+      const start = pattern.lastIndex;
+      let content, end;
+      if (segment.text[start] === '{') {
+        let depth = 1;
+        end = start + 1;
+        for (; end < segment.text.length && end - start < 100; end++) {
+          if (escaped(segment.text, end)) continue;
+          if (segment.text[end] === '{') depth++;
+          if (segment.text[end] === '}' && --depth === 0) break;
+        }
+        if (depth !== 0) continue;
+        content = segment.text.slice(start + 1, end);
+        end++;
+      } else {
+        const token = /^(?:\\[A-Za-z]+|\\[^A-Za-z]|[^\s{}_^])/.exec(segment.text.slice(start));
+        if (!token) continue;
+        content = token[0];
+        end = start + content.length;
+      }
+      if (content.trim() && !/[\r\n$%]/.test(content)) found.push({base:match[1],content,start:segment.start + match.index});
+      pattern.lastIndex = end;
+    }
+    return found;
+  }
+
+  function indexSuggestions(context, parsed, text, cursor, settings) {
+    const index = context.classification?.index;
+    if (context.classification?.kind !== 'index' || !index?.base) return [];
+    const typed = index.content || '';
+    const needle = compact(typed);
+    const proposals = [];
+    for (const segment of context.segments) {
+      for (const source of observedIndices(segment)) {
+        if (Classifier.canonicalSymbol(source.base) !== Classifier.canonicalSymbol(index.base)) continue;
+        // A suffix cannot add braces before an already typed unbraced command.
+        // Reusing a composite argument here would change the subscript's meaning.
+        if (!index.braced && typed && !/^(?:[A-Za-z0-9]|\\[A-Za-z]+)$/.test(source.content.trim())) continue;
+        const normalized = compactWithPositions(source.content);
+        if (!normalized.value.startsWith(needle)) continue;
+        const offset = needle.length ? normalized.positions[needle.length - 1] + 1 : 0;
+        let suffix = source.content.slice(offset);
+        if (/\s$/.test(typed)) suffix = suffix.trimStart();
+        if (index.braced) suffix += '}';
+        else if (!typed && !/^(?:[A-Za-z0-9]|\\[A-Za-z]+)$/.test(source.content)) suffix = '{' + source.content + '}';
+        if (!suffix.trim()) continue;
+        const candidate = finish(suffix, 'index', 'Reuse an index for this symbol', text, cursor, settings, {
+          source:source.base + '_{' + source.content + '}', position:source.start, itemId:segment.itemId,
+          itemTier:Context.scopeTier(parsed, cursor, segment.start), reliable:true,
+          legacyScore:needle.length * 10000 - Math.min(Math.abs(cursor - source.start), 10000),
+        });
+        if (candidate) proposals.push(semanticFeatures(candidate, context));
+      }
+    }
+    return proposals.sort((a,b)=>b.itemTier-a.itemTier || b.semanticScore-a.semanticScore ||
+      b.legacyScore-a.legacyScore).slice(0, 12);
+  }
 
   function createEngine(initialSettings) {
     let cachedText;
@@ -314,17 +443,20 @@
         .sort((a, b) => Context.scopeTier(parsed, cursor, b.start) - Context.scopeTier(parsed, cursor, a.start) ||
           Math.abs(a.start - cursor) - Math.abs(b.start - cursor)).slice(0, 128);
       const context = { prefix, right: parsed.clean.slice(cursor, Math.min(region.end, cursor + settings.maxSuggestionLength)),
-        segments, itemId, ancestorIds, cursor, maxTokens: 12, maxCandidates: 32 };
+        segments, itemId, ancestorIds, cursor, maxTokens: 12, maxCandidates: 32,
+        declarations: declarationContext(parsed, active, cursor) };
+      context.classification = Classifier.analyze(context);
       const candidates = [];
       if (settings.sequences) {
         const sequence = sequenceSuggestion(parsed, region, documentText, cursor, settings);
         if (sequence) candidates.push(sequence);
       }
       if (settings.expressions) {
-        candidates.push(...expressionSuggestions(parsed, region, documentText, cursor, settings));
+        candidates.push(...indexSuggestions(context, parsed, documentText, cursor, settings));
+        candidates.push(...expressionSuggestions(parsed, region, documentText, cursor, settings, context));
         // Generative v1 fills the end of an expression or an auto-paired group.
         // Existing expression retrieval can still fill known gaps in other text.
-        if (compact(prefix).length >= settings.minPrefix && /^[\s}\])]*$/.test(context.right)) {
+        if ((compact(prefix).length >= settings.minPrefix || context.classification.kind === 'index') && /^[\s}\])]*$/.test(context.right)) {
           for (const proposal of predictor.candidates(context)) {
             const result = finish(proposal.fullText ?? proposal.insertText, proposal.kind || 'prediction',
               'Predict a mathematical continuation', documentText, cursor, settings, proposal);
@@ -342,13 +474,16 @@
       const unique = new Map();
       for (const candidate of candidates) {
         if (!candidate.insertText?.trim()) continue;
+        semanticFeatures(candidate, context);
+        if (context.classification.kind === 'index' && candidate.features.indexFit <= -1) continue;
         candidate.scopeTier = candidate.itemTier;
         candidate.features = { ...candidate.features, sameItem: candidate.itemTier === 2 ? 1 : 0,
           parentItem: candidate.itemTier === 1 ? 1 : 0,
           sameItemEvidence: candidate.features?.sameItemEvidence ?? (candidate.itemTier === 2 ? 1 : 0),
           ancestorEvidence: candidate.features?.ancestorEvidence ?? (candidate.itemTier === 1 ? 1 : 0) };
         const previous = unique.get(candidate.insertText);
-        if (!previous || candidate.itemTier > previous.itemTier) unique.set(candidate.insertText, candidate);
+        if (!previous || candidate.itemTier > previous.itemTier ||
+            (candidate.itemTier === previous.itemTier && candidate.semanticScore > previous.semanticScore)) unique.set(candidate.insertText, candidate);
       }
       return { candidates: [...unique.values()].sort((a, b) => b.itemTier - a.itemTier).slice(0, 32), context };
     }
@@ -359,19 +494,9 @@
         const collected = collectCandidates(documentText, cursor, overrides);
         if (!collected?.candidates.length) return null;
         const ranked = predictor.rank(collected.candidates, collected.context);
-        // Scope priority is a product requirement, independent of learned weights.
-        ranked.sort((a, b) => b.itemTier - a.itemTier);
-        if (!predictor.trained) {
-          const bestTier = ranked[0]?.itemTier ?? 0;
-          const reliable = collected.candidates.filter((candidate) => candidate.itemTier === bestTier &&
-            (candidate.kind === 'sequence' || candidate.kind === 'expression'));
-          reliable.sort((a, b) => Number(b.kind === 'sequence') - Number(a.kind === 'sequence') ||
-            (b.legacyScore || 0) - (a.legacyScore || 0));
-          if (reliable.length) return reliable[0];
-        }
         const threshold = predictor.trained && Number.isFinite(artifact?.training?.recommendedThreshold)
           ? Math.max(0, Math.min(1, artifact.training.recommendedThreshold)) : 0;
-        return ranked[0]?.score >= threshold ? ranked[0] : null;
+        return selectCandidate(ranked, threshold);
       },
       isMathContext(documentText, cursor) {
         return typeof documentText === 'string' && Boolean(Context.contextAt(parse(documentText), cursor));
@@ -388,5 +513,5 @@
     return Boolean(Context.contextAt(gateParse, cursor));
   }
 
-  return { DEFAULT_SETTINGS, createEngine, isMathContext };
+  return { DEFAULT_SETTINGS, createEngine, isMathContext, selectCandidate };
 });

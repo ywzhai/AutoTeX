@@ -3,7 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
-  TOKENIZER_VERSION, FEATURE_NAMES, END_TOKEN, tokenize, buildNgrams,
+  TOKENIZER_VERSION, SCHEMA_VERSION, CLASSIFIER_VERSION, FEATURE_NAMES, END_TOKEN, tokenize, buildNgrams,
   validateArtifact, createUntrainedArtifact, createPredictor, validateCandidate, featureValues,
 } = require("../extension/predictor.js");
 
@@ -231,7 +231,7 @@ test("malformed models fail closed for generation while legacy candidates retain
   const base = createUntrainedArtifact(buildNgrams(["x+y"]));
   const malformed = [
     null,
-    { ...base, schemaVersion: 2 },
+    { ...base, schemaVersion: 999 },
     { ...base, tokenizerVersion: "different" },
     { ...base, trained: true },
     { ...base, ngrams: { ...base.ngrams, order: 9 } },
@@ -261,3 +261,122 @@ test("duplicate model contexts and mismatched feature order are rejected", () =>
   assert.equal(validateArtifact(artifact), false);
 });
 
+
+test("model schema requires current classifier features and rejects stale trained artifacts", () => {
+  const current = trainedArtifact({ categoryMatch: 1, indexFit: 2, symbolTypeMatch: 3 });
+  assert.equal(current.schemaVersion, SCHEMA_VERSION);
+  assert.equal(current.classifierVersion, CLASSIFIER_VERSION);
+  assert.equal(validateArtifact(current), true);
+  const legacyRanker = Object.fromEntries(Object.entries(current.ranker).map(([key, value]) =>
+    [key, Array.isArray(value) ? value.slice(0, 15) : value]));
+  assert.equal(validateArtifact({ ...current, schemaVersion: 1, ranker: legacyRanker }), false);
+  assert.equal(validateArtifact({ ...current, ranker: legacyRanker }), false);
+  assert.equal(validateArtifact({ ...current, classifierVersion: "autotex-context-old" }), false);
+  assert.equal(validateArtifact({ ...current, classifierVersion: undefined }), false);
+  assert.equal(validateArtifact({
+    schemaVersion: 1, tokenizerVersion: TOKENIZER_VERSION, trained: false,
+    ngrams: buildNgrams(["x+y"]), ranker: null,
+  }), true);
+  const stale = createPredictor({ ...current, schemaVersion: 1, ranker: legacyRanker });
+  assert.deepEqual(stale.candidates({ prefix: "x+", segments: segments(["x+y"]) }), []);
+  assert.equal(stale.rank([{ insertText: "y", kind: "expression" }], { prefix: "x+" }).length, 1);
+});
+
+test("ordinary set and arithmetic commands remain available without corpus examples", () => {
+  for (const suffix of ["\\not\\in A", "\\mid n", "\\gcd(a,b)", "\\bigcup_{i=1}^{n}A_i"]) {
+    assert.equal(validateCandidate({ fullText: suffix }, { prefix: "x" }), true, suffix);
+  }
+  assert.equal(validateCandidate({ fullText: "\\not" }, { prefix: "x" }), false);
+});
+
+function typedContext(prefix) {
+  return {
+    prefix, itemId: "current",
+    segments: segments([
+      "A \\subseteq \\mathbb{R}",
+      "B \\subseteq \\mathbb{R}",
+      "x \\in \\mathbb{R}",
+    ]),
+  };
+}
+
+test("baseline prefers a declared set over a scalar after intersection", () => {
+  const ranked = createPredictor().rank([
+    { insertText: "x", kind: "prediction", itemTier: 2 },
+    { insertText: "B", kind: "prediction", itemTier: 2 },
+  ], typedContext("A \\cap "));
+  assert.equal(ranked[0].insertText, "B");
+  assert.ok(ranked[0].features.categoryMatch > 0);
+  assert.ok(ranked[0].features.symbolTypeMatch > 0);
+  assert.ok(ranked[1].features.symbolTypeMatch < 0);
+  assert.equal(ranked.length, 2, "Type evidence is a preference, not a hard prohibition");
+});
+
+test("index ranking prefers a numeric increment while generation completes a balanced subscript", () => {
+  const predictor = createPredictor();
+  const context = { prefix: "a_{i+", itemId: "current", segments: segments(["a_{i+1}"]) };
+  const ranked = predictor.rank([
+    { insertText: "\\cup B}", kind: "prediction", itemTier: 2 },
+    { insertText: "1}", kind: "prediction", itemTier: 2 },
+  ], context);
+  assert.equal(ranked[0].insertText, "1}");
+  assert.ok(ranked[0].features.indexFit > ranked[1].features.indexFit);
+  const candidates = predictor.candidates({ ...context, maxTokens: 2 });
+  assert.equal(candidates[0].fullText, "1}");
+  assert.equal(validateCandidate(candidates[0], context), true);
+});
+
+test("type guidance reaches beam generation and keeps legal group intersections", () => {
+  const Classifier = require("../extension/classifier.js");
+  const context = typedContext("A \\cap ");
+  const classification = Classifier.analyze(context);
+  const artifact = createUntrainedArtifact(buildNgrams(["A \\cap B", "A \\cap x"]));
+  const candidates = createPredictor(artifact).candidates({
+    prefix: context.prefix, classification, segments: [], maxTokens: 1, maxCandidates: 8,
+  });
+  assert.equal(candidates[0].insertText, "B");
+  assert.ok(candidates.some((candidate) => candidate.insertText === "x"));
+
+  const groupContext = {
+    prefix: "G \\cap ", itemId: "current",
+    segments: segments(["G \\cap H"]),
+    declarations: [{ text: "G is a group. H is a group.", itemId: "current" }],
+    maxTokens: 1,
+  };
+  assert.ok(createPredictor().candidates(groupContext).some((candidate) => candidate.insertText === "H"));
+});
+
+test("classifier feature vectors agree with trained scoring and refresh when context changes", () => {
+  const artifact = trainedArtifact({ categoryMatch: 2, indexFit: 3, symbolTypeMatch: 4 });
+  artifact.ranker.bias = -0.2;
+  for (const name of ["categoryMatch", "indexFit", "symbolTypeMatch"]) {
+    const at = FEATURE_NAMES.indexOf(name);
+    artifact.ranker.means[at] = 0.1;
+    artifact.ranker.scales[at] = 2;
+  }
+  const predictor = createPredictor(artifact);
+  const original = { insertText: "B", kind: "expression", itemTier: 2, semanticScore: 7,
+    features: { categoryMatch: -1, indexFit: -1, symbolTypeMatch: -1, custom: 42 } };
+  const context = typedContext("A \\cap ");
+  const ranked = predictor.rank([original], context)[0];
+  const values = featureValues(original, context);
+  assert.equal(values.length, 18);
+  assert.deepEqual(FEATURE_NAMES.map((name) => ranked.features[name]), values);
+  const logit = artifact.ranker.bias + values.reduce((sum, value, at) =>
+    sum + artifact.ranker.weights[at] * (value - artifact.ranker.means[at]) / artifact.ranker.scales[at], 0);
+  assert.ok(Math.abs(ranked.score - 1 / (1 + Math.exp(-logit))) < 1e-12);
+  assert.ok(ranked.features.categoryMatch > 0, "Previously cached features do not override the current type");
+  assert.equal(ranked.semanticScore, 7);
+  assert.equal(ranked.features.custom, 42);
+  const reranked = predictor.rank([ranked], typedContext("x+"))[0];
+  assert.ok(reranked.features.categoryMatch < ranked.features.categoryMatch);
+  assert.ok(reranked.features.symbolTypeMatch < 0);
+  assert.equal(original.features.categoryMatch, -1, "The caller's candidate is not mutated");
+});
+
+test("unknown symbol types remain neutral instead of being inferred from letter names", () => {
+  const values = featureValues({ insertText: "R", kind: "prediction" }, { prefix: "G", segments: [] });
+  for (const name of ["categoryMatch", "indexFit", "symbolTypeMatch"]) {
+    assert.equal(values[FEATURE_NAMES.indexOf(name)], 0, name);
+  }
+});

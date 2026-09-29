@@ -53,16 +53,17 @@ npm run model:train
 
 The command reads `dataset/` and produces:
 
-- `artifacts/model.json`: schema version 1, tokenizer version, pruned n-gram tables, ranker coefficients/scaling, and training provenance.
-- `artifacts/model.report.json`: serialized JSON model size in bytes, split counts, and held-out simulated-typing metrics, including candidate coverage, matching/mismatching displays, and matching characters.
+- `artifacts/model.json`: schema version 2, tokenizer/classifier versions, pruned n-gram tables, 18-feature ranker coefficients/scaling, and training provenance.
+- `artifacts/model.report.json`: serialized JSON model size in bytes, split counts, and held-out simulated-typing metrics, including candidate coverage, matching/mismatching displays, and matching characters. Reports include per-category results (index, set, algebra, function, scalar, unknown), document-supported versus generated outcomes, and the validation-only threshold curve.
 
 Training proceeds as follows:
 
 1. Count token sequences of orders 1–5 using only the n-gram split. The shared tokenizer preserves control words, individual ordinary math letters, digit runs, braces, and normalized whitespace. Prune rare context/successor counts to bound the artifact.
-2. Sample append cursors from the separate ranker split, including positions inside command words and multi-digit numbers. For each sample, give candidate generation **only the document prefix up to the cursor**. Hidden target text and all later text are absent from retrieval and local counts. Never index the hidden answer.
-3. Label a candidate positive when its tokens match a prefix of the hidden continuation, ignoring ordinary whitespace. Collect the shared features from all candidate providers. Fit feature means/scales on ranker examples only, then train an L2-regularized logistic model with deterministic stochastic gradient descent.
-4. Install the fitted ranker into candidate generation before collecting validation/test examples, matching the deployed shortlist selection. Use the validation split to choose a display threshold. The initial utility is matching characters minus 16 for each mismatching display; this is a tunable product choice, not a measured user-cost estimate.
-5. Evaluate once on the separate test split using the chosen threshold. The test split never trains counts, coefficients, scaling, or the threshold.
+2. Classify the visible cursor context using deterministic syntax and scoped symbol evidence. The classifier is a small rules engine, not a separately trained neural network. It distinguishes object context from an unfinished subscript and adds category compatibility, index fit, and symbol-type compatibility to the original 15 ranking features.
+3. Sample append cursors from the separate ranker split, including positions inside command words and multi-digit numbers. For each sample, give candidate generation **only the document prefix up to the cursor**. Hidden target text and all later text are absent from retrieval and local counts. Never index the hidden answer.
+4. Label a candidate positive when its tokens match a prefix of the hidden continuation, ignoring ordinary whitespace. Collect the shared features from all candidate providers. Fit feature means/scales on ranker examples only, then train an L2-regularized logistic model with deterministic stochastic gradient descent.
+5. Install the fitted ranker into candidate generation before collecting validation/test examples, matching the deployed shortlist selection. Use the validation split to choose a display threshold for generated suggestions. Existing formula/sequence reuse and observed indices for the same base symbol bypass that learned gate; both the runtime and evaluator call the same selection helper. The current-item tier still takes precedence. The initial utility is matching characters minus 16 for each mismatching display; this is a tunable product choice, not a measured user-cost estimate.
+6. Evaluate once on the separate test split using the chosen threshold. The test split never trains counts, coefficients, scaling, or the threshold.
 
 If the ranker sees no positive or no negative examples, training fails with a clear error. Add varied documents or raise `--max-samples`; do not turn fabricated weights into a supposedly trained artifact. Validation/test documents must also produce candidates.
 
@@ -76,9 +77,15 @@ Once the report is acceptable, rerun training with a browser export:
 npm run model:train -- --browser-output "extension\model.js"
 ```
 
-This replaces the untrained `extension/model.js` with a bundle exporting `AutoTexModel`. JSON remains the source artifact; the browser bundle has equivalent data and CommonJS support for tests. The tokenizer version and feature schema must match the runtime. Reload the unpacked extension and refresh the Overleaf page after replacing the model. Run `npm test`, `npm run test:browser`, and `npm run package` before sharing a new package.
+This replaces the untrained `extension/model.js` with a bundle exporting `AutoTexModel`. JSON remains the source artifact; the browser bundle has equivalent data and CommonJS support for tests. The tokenizer version, classifier version, and feature schema must match the runtime. Trained schema-1 artifacts are rejected and must be retrained for the new 18-feature schema; an untrained schema-1 placeholder is accepted for migration. Reload the unpacked extension and refresh the Overleaf page after replacing the model. Run `npm test`, `npm run test:browser`, and `npm run package` before sharing a new package.
 
 Keep the original untrained model file in version control so you can restore it if a trained model performs poorly. Do not commit the dataset by default; keep its location outside the repository or explicitly ignore it.
+
+## Classifier scope and limitations
+
+Type inference uses standard number-set notation, explicit declarations, membership and subset relations, function signatures, and index syntax. Plain letters carry no fixed type. Evidence is local and approximate: it does not prove a mathematical fact or expand arbitrary user macros. Mixed categories remain possible (for example, a group is also a set), so semantic differences normally change ranking rather than reject a completion. Only clear syntax violations are filtered.
+
+The classifier executes before candidate selection and is bounded independently of corpus size. To add notation, extend the relevant detector in `extension/classifier.js` and add ambiguity, scope, and boundary regressions. If feature meanings change, bump the classifier version and retrain; adding ranking features also requires an artifact schema change. Use per-category validation results to identify weak cases, and reserve test results for final evaluation.
 
 ## Training controls
 

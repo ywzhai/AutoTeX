@@ -182,9 +182,11 @@ test('simulated typing never passes hidden or future source to candidate generat
     calls.push({ visible, cursor });
     assert.equal(visible.length, cursor);
     assert.equal(visible, text.slice(0, cursor));
-    return { candidates: [], context: { prefix: visible } };
+    return { candidates: [], context: { prefix: visible, classification: { kind: 'index' } } };
   } };
-  Training.generateExamples(corpus.documents, null, { ...Training.DEFAULTS, maxSamples: 1000 }, engine);
+  const samples = Training.generateExamples(corpus.documents, null, { ...Training.DEFAULTS, maxSamples: 1000 }, engine);
+  assert.equal(samples.sampledByCategory.index, samples.sampledCursors, 'preserve visible-context category even without candidates');
+  assert.equal(samples.examples.length, 0);
   assert.ok(calls.length > 5);
   assert.ok(calls.some((call) => call.visible.endsWith('\\fr')), 'sample cursors inside control words');
   assert.ok(calls.filter((call) => call.cursor < text.indexOf('Later')).every((call) => !call.visible.includes('FUTURE')));
@@ -200,6 +202,46 @@ test('completion labels preserve command boundaries and reconstruct partial comm
   assert.equal(Training.candidateMatches('x', ' + y', '+y+z'), true);
 });
 
+test('evaluation keeps reliable completions visible and reports actual outcomes by category and source', () => {
+  const Engine = require('../extension/engine.js');
+  const dimensions = Predictor.FEATURE_NAMES.length;
+  const ranker = { features: [...Predictor.FEATURE_NAMES], weights: Array(dimensions).fill(0),
+    bias: -8, means: Array(dimensions).fill(0), scales: Array(dimensions).fill(1) };
+  const row = (extra = {}) => ({ features: Array(dimensions).fill(0), label: 1, chars: 1,
+    insertText: 'n', itemTier: 2, scopeTier: 2, kind: 'prediction', reliable: false,
+    semanticScore: 0, legacyScore: 0, ...extra });
+  const samples = { sampledCursors: 5,
+    sampledByCategory: { index: 1, set: 1, algebra: 1, function: 0, scalar: 1, unknown: 1 },
+    examples: [
+      { category: 'index', rows: [row({ label: 0 }), row({ kind: 'index', reliable: true, semanticScore: 3 })] },
+      { category: 'set', rows: [row({ kind: 'expression', legacyScore: 7 }), row({ label: 0 })] },
+      { category: 'algebra', rows: [row()] },
+      { category: 'scalar', rows: [row({ kind: 'sequence', label: 0 })] }
+    ] };
+  const metrics = Training.evaluate(samples, ranker, 0.95);
+  assert.equal(metrics.shown, 3, 'a rejecting learned threshold gates only generated suggestions');
+  assert.equal(metrics.matching, 2);
+  assert.equal(metrics.mismatching, 1);
+  assert.equal(metrics.bySource.reliable.shown, 3);
+  assert.equal(metrics.bySource.generated.shown, 0);
+  assert.equal(metrics.byCategory.index.matching, 1);
+  assert.equal(metrics.byCategory.set.matching, 1);
+  assert.equal(metrics.byCategory.algebra.shown, 0);
+  assert.equal(metrics.byCategory.scalar.mismatching, 1);
+  assert.equal(metrics.byCategory.unknown.sampledCursors, 1);
+  assert.equal(metrics.byCategory.unknown.coverage, 0);
+  const selected = samples.examples.map((example) =>
+    Engine.selectCandidate(example.rows.map((candidate) => ({ ...candidate, score: Training.probability(candidate, ranker) })), 0.95));
+  assert.equal(selected.filter(Boolean).length, metrics.shown);
+  assert.equal(selected.filter((candidate) => candidate?.label).length, metrics.matching);
+  const curve = Training.thresholdCurve(samples, ranker);
+  assert.equal(curve.length, 20);
+  assert.equal(curve[0].threshold, 0);
+  assert.equal(curve.at(-1).threshold, 0.95);
+  assert.equal(curve[0].metrics.bySource.generated.shown, 1);
+  assert.deepEqual(curve.at(-1).metrics, metrics);
+});
+
 test('prepare and train produce reproducible validated artifacts without copying source documents', (t) => {
   const directory = temporary(t);
   const input = path.join(directory, 'data');
@@ -210,10 +252,13 @@ test('prepare and train produce reproducible validated artifacts without copying
   assert.equal(prepared.preparation.documents, 8);
   assert.equal(prepared.artifact, undefined);
   const generationArtifacts = [];
+  const generationSamples = [];
   const progress = [];
   const first = Training.train(options, { onProgress: (message) => progress.push(message), generateExamples(documents, artifact, settings) {
     generationArtifacts.push(artifact);
-    return Training.generateExamples(documents, artifact, settings);
+    const samples = Training.generateExamples(documents, artifact, settings);
+    generationSamples.push(samples);
+    return samples;
   } });
   assert.match(progress[0], /Reading LaTeX/);
   assert.ok(progress.some((message) => message.includes('Loaded 8 mathematical documents')));
@@ -224,6 +269,16 @@ test('prepare and train produce reproducible validated artifacts without copying
   assert.deepEqual(generationArtifacts[1].ranker, first.artifact.ranker);
   assert.deepEqual(generationArtifacts[2].ranker, first.artifact.ranker);
   assert.equal(first.artifact.trained, true);
+  assert.equal(first.artifact.schemaVersion, Predictor.SCHEMA_VERSION);
+  assert.equal(first.artifact.classifierVersion, Predictor.CLASSIFIER_VERSION);
+  assert.deepEqual(first.artifact.ranker.features.slice(-3), ['categoryMatch', 'indexFit', 'symbolTypeMatch']);
+  assert.equal(first.report.classifierVersion, first.artifact.classifierVersion);
+  assert.equal(first.report.thresholdSource, 'validation');
+  assert.deepEqual(first.report.validationThresholdCurve, Training.thresholdCurve(generationSamples[1], first.artifact.ranker));
+  assert.equal(first.report.recommendedThreshold, Training.tuneThreshold(generationSamples[1], first.artifact.ranker));
+  assert.equal(Object.hasOwn(first.report, 'testThresholdCurve'), false);
+  assert.deepEqual(Object.keys(first.report.test.byCategory), Training.CATEGORIES);
+  assert.equal(Object.values(first.report.test.byCategory).reduce((sum, category) => sum + category.sampledCursors, 0), first.report.test.sampledCursors);
   assert.equal(Predictor.validateArtifact(first.artifact), true);
   assert.ok(first.report.ranker.positives > 0);
   assert.ok(first.report.ranker.negatives > 0);

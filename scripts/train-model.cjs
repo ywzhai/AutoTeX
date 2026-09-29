@@ -7,12 +7,16 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { analyzeDocument, mathSegments } = require('../extension/context.js');
 const Predictor = require('../extension/predictor.js');
-const { createEngine } = require('../extension/engine.js');
+const Engine = require('../extension/engine.js');
+const { createEngine } = Engine;
 
 const DEFAULTS = Object.freeze({ seed: 1729, order: 5, minCount: 2, maxContexts: 12000,
   maxSuccessors: 16, maxSamples: 64, epochs: 40, maxDocumentBytes: 5000000 });
 const REPOSITORY_ROOT = path.resolve(__dirname, '..');
 const SPLITS = ['train', 'rank', 'validation', 'test'];
+const CATEGORIES = Object.freeze(['index', 'set', 'algebra', 'function', 'scalar', 'unknown']);
+const categoryName = (value) => CATEGORIES.includes(value) ? value : 'unknown';
+const sourceName = (candidate) => candidate.reliable || ['expression', 'sequence'].includes(candidate.kind) ? 'reliable' : 'generated';
 const GROUPING = Object.freeze({ version: 2, shingleSize: 5, jaccard: 0.85,
   minimumContainmentShingles: 100, containment: 0.9,
   minimumSegmentTokens: 5, minimumContainedSegments: 10, orderedSegmentCoverage: 0.9 });
@@ -255,6 +259,7 @@ function candidateMatches(prefix, insertion, continuation) {
 function generateExamples(documents, artifact, options, engine = createEngine({ model: artifact })) {
   const random = randomGenerator(options.seed ^ 0x9E3779B9);
   const examples = [];
+  const sampledByCategory = Object.fromEntries(CATEGORIES.map((category) => [category, 0]));
   let sampledCursors = 0;
   for (const document of documents) {
     for (const cursor of samplePositions(document, options.maxSamples, random)) {
@@ -266,6 +271,8 @@ function generateExamples(documents, artifact, options, engine = createEngine({ 
       // Simulated append: neither the answer nor any later text enters retrieval/local counts.
       const visible = document.text.slice(0, cursor);
       const collected = engine.collectCandidates(visible, visible.length);
+      const category = categoryName(collected?.context?.classification?.kind);
+      sampledByCategory[category]++;
       if (!collected) continue;
       const rows = [];
       for (const candidate of collected.candidates) {
@@ -275,15 +282,18 @@ function generateExamples(documents, artifact, options, engine = createEngine({ 
           throw new Error('Candidate feature schema or numeric value is invalid.');
         }
         rows.push({ features, label: Number(candidateMatches(collected.context.prefix, candidate.insertText, continuation)), chars: candidate.insertText.length,
-          scopeTier: candidate.scopeTier ?? candidate.itemTier ?? 0, insertText: candidate.insertText });
+          scopeTier: candidate.scopeTier ?? candidate.itemTier ?? 0,
+          itemTier: candidate.itemTier ?? candidate.scopeTier ?? 0, insertText: candidate.insertText,
+          kind: candidate.kind, reliable: Boolean(candidate.reliable),
+          legacyScore: candidate.legacyScore ?? 0, semanticScore: candidate.semanticScore ?? 0 });
       }
-      if (rows.length) examples.push({ rows });
+      if (rows.length) examples.push({ rows, category });
     }
   }
-  return { examples, sampledCursors };
+  return { examples, sampledCursors, sampledByCategory };
 }
 
-const sigmoid = (value) => 1 / (1 + Math.exp(-Math.max(-35, Math.min(35, value))));
+const sigmoid = (value) => 1 / (1 + Math.exp(-Math.max(-40, Math.min(40, value))));
 
 function trainRanker(examples, options) {
   const rows = examples.flatMap((example) => example.rows);
@@ -321,38 +331,76 @@ function probability(row, ranker) {
   return sigmoid(score);
 }
 
+function emptyMetrics(sampledCursors) {
+  return { sampledCursors, cursorsWithCandidates: 0, cursorsWithMatchingCandidate: 0,
+    shown: 0, matching: 0, mismatching: 0, matchingCharacters: 0 };
+}
+
+function finishMetrics(metrics) {
+  return { ...metrics, precision: metrics.shown ? metrics.matching / metrics.shown : null,
+    coverage: metrics.sampledCursors ? metrics.shown / metrics.sampledCursors : 0 };
+}
+
+function recordCandidates(metrics, rows) {
+  if (rows.length) metrics.cursorsWithCandidates++;
+  if (rows.some((row) => row.label)) metrics.cursorsWithMatchingCandidate++;
+}
+
+function recordSelection(metrics, selected) {
+  if (!selected) return;
+  metrics.shown++;
+  if (selected.label) { metrics.matching++; metrics.matchingCharacters += selected.chars; }
+  else metrics.mismatching++;
+}
+
 function evaluate(samples, ranker, threshold = 0) {
-  let available = 0;
-  let shown = 0;
-  let correct = 0;
-  let characters = 0;
-  for (const example of samples.examples) {
-    if (example.rows.some((row) => row.label)) available++;
-    const rows = example.rows.map((row) => ({ ...row, probability: probability(row, ranker) }));
-    // Preserve the runtime's hard preference for the current item before learned scoring.
-    rows.sort((a, b) => b.scopeTier - a.scopeTier || b.probability - a.probability ||
-      b.chars - a.chars || (a.insertText || '').localeCompare(b.insertText || ''));
-    const best = rows[0];
-    if (best && best.probability >= threshold) {
-      shown++;
-      if (best.label) { correct++; characters += best.chars; }
-    }
+  const totals = samples.sampledByCategory ? { ...samples.sampledByCategory } :
+    Object.fromEntries(CATEGORIES.map((category) => [category, 0]));
+  if (!samples.sampledByCategory) {
+    for (const example of samples.examples) totals[categoryName(example.category)]++;
+    totals.unknown += Math.max(0, samples.sampledCursors - samples.examples.length);
   }
-  return { sampledCursors: samples.sampledCursors, cursorsWithCandidates: samples.examples.length,
-    cursorsWithMatchingCandidate: available, shown, matching: correct, mismatching: shown - correct,
-    matchingCharacters: characters, precision: shown ? correct / shown : null,
-    coverage: samples.sampledCursors ? shown / samples.sampledCursors : 0 };
+  const overall = emptyMetrics(samples.sampledCursors);
+  const byCategory = Object.fromEntries(CATEGORIES.map((category) => [category, emptyMetrics(totals[category] || 0)]));
+  const bySource = { reliable: emptyMetrics(samples.sampledCursors), generated: emptyMetrics(samples.sampledCursors) };
+  for (const example of samples.examples) {
+    const category = byCategory[categoryName(example.category)];
+    const rows = example.rows.map((row) => ({ ...row, score: probability(row, ranker) }));
+    rows.sort((a, b) => (b.itemTier ?? b.scopeTier ?? 0) - (a.itemTier ?? a.scopeTier ?? 0) ||
+      b.score - a.score || b.chars - a.chars || (a.insertText || '').localeCompare(b.insertText || ''));
+    recordCandidates(overall, rows);
+    recordCandidates(category, rows);
+    for (const source of Object.keys(bySource)) recordCandidates(bySource[source], rows.filter((row) => sourceName(row) === source));
+    // Share the exact deployed selection policy, including reliable-provider fallback
+    // and winning-item priority. The learned gate applies to generated candidates.
+    const selected = Engine.selectCandidate(rows, threshold);
+    recordSelection(overall, selected);
+    recordSelection(category, selected);
+    if (selected) recordSelection(bySource[sourceName(selected)], selected);
+  }
+  return { ...finishMetrics(overall),
+    byCategory: Object.fromEntries(Object.entries(byCategory).map(([name, metrics]) => [name, finishMetrics(metrics)])),
+    bySource: Object.fromEntries(Object.entries(bySource).map(([name, metrics]) => [name, finishMetrics(metrics)])) };
+}
+
+function thresholdCurve(samples, ranker) {
+  return Array.from({ length: 20 }, (_, step) => {
+    const threshold = step / 20;
+    const metrics = evaluate(samples, ranker, threshold);
+    return { threshold, utility: metrics.matchingCharacters - metrics.mismatching * 16, metrics };
+  });
+}
+
+function bestThreshold(curve) {
+  let result = { threshold: 0.5, utility: -Infinity };
+  for (const point of curve) {
+    if (point.utility > result.utility || point.utility === result.utility && point.threshold > result.threshold) result = point;
+  }
+  return result.threshold;
 }
 
 function tuneThreshold(samples, ranker) {
-  let result = { threshold: 0.5, utility: -Infinity };
-  for (let step = 0; step <= 19; step++) {
-    const threshold = step / 20;
-    const metrics = evaluate(samples, ranker, threshold);
-    const utility = metrics.matchingCharacters - metrics.mismatching * 16;
-    if (utility > result.utility || utility === result.utility && threshold > result.threshold) result = { threshold, utility };
-  }
-  return result.threshold;
+  return bestThreshold(thresholdCurve(samples, ranker));
 }
 
 function summarize(corpus, grouped, options) {
@@ -385,7 +433,7 @@ function train(options, dependencies = {}) {
   const ngrams = Predictor.buildNgrams(segments, { order: options.order, smoothing: 3,
     minCount: options.minCount, maxContexts: options.maxContexts, maxSuccessors: options.maxSuccessors,
     maxTokens: trainingTokens });
-  const initial = { schemaVersion: 1, trained: false, tokenizerVersion: Predictor.TOKENIZER_VERSION, ngrams, ranker: null };
+  const initial = Predictor.createUntrainedArtifact(ngrams);
   if (!Predictor.validateArtifact(initial)) throw new Error('Generated n-gram artifact failed runtime validation.');
   onProgress('Generating ranker examples from ' + grouped.splits.rank.length + ' documents...');
   const rankSamples = collectExamples(grouped.splits.rank, initial, options);
@@ -401,16 +449,19 @@ function train(options, dependencies = {}) {
   if (!validation.examples.length || !test.examples.length) {
     throw new Error('Validation and test documents must produce candidates. Add representative mathematical documents or increase --max-samples.');
   }
-  const threshold = tuneThreshold(validation, fitted.ranker);
+  const validationThresholdCurve = thresholdCurve(validation, fitted.ranker);
+  const threshold = bestThreshold(validationThresholdCurve);
   const artifact = { ...fittedArtifact,
     training: { ...preparation, settings: { order: options.order, minCount: options.minCount,
       maxContexts: options.maxContexts, maxSuccessors: options.maxSuccessors, maxSamples: options.maxSamples,
       epochs: options.epochs }, trainingTokens, rankerExamples: fitted.counts, recommendedThreshold: threshold } };
   if (!Predictor.validateArtifact(artifact)) throw new Error('Trained artifact failed runtime validation.');
-  const report = { format: 'autotex-training-report-v1', tokenizerVersion: Predictor.TOKENIZER_VERSION,
+  const report = { format: 'autotex-training-report-v2', tokenizerVersion: Predictor.TOKENIZER_VERSION,
+    schemaVersion: initial.schemaVersion, classifierVersion: initial.classifierVersion,
     corpus: preparation, trainingTokens, ngramContexts: ngrams.contexts.length,
     serializedModelBytes: Buffer.byteLength(JSON.stringify(artifact) + '\n', 'utf8'), ranker: fitted.counts,
-    recommendedThreshold: threshold, validation: evaluate(validation, fitted.ranker, threshold),
+    recommendedThreshold: threshold, thresholdSource: 'validation', validationThresholdCurve,
+    validation: evaluate(validation, fitted.ranker, threshold),
     test: evaluate(test, fitted.ranker, threshold),
     evaluation: 'Simulated append with token-normalized prefix matching; not a mathematical-correctness or real-user-acceptance measurement.' };
   onProgress('Writing model and held-out evaluation report...');
@@ -458,5 +509,5 @@ if (require.main === module) {
   }
 }
 
-module.exports = { DEFAULTS, GROUPING, parseArguments, loadCorpus, splitCorpus, samplePositions,
-  generateExamples, trainRanker, probability, evaluate, train, tokenKey, candidateMatches };
+module.exports = { DEFAULTS, GROUPING, CATEGORIES, parseArguments, loadCorpus, splitCorpus, samplePositions,
+  generateExamples, trainRanker, probability, evaluate, thresholdCurve, tuneThreshold, train, tokenKey, candidateMatches };
