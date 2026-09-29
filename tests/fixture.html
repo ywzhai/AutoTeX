@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Overleaf editor integration fixture</title>
+    <link rel="stylesheet" href="/extension/editor.css">
+    <style>
+      body { margin: 32px; background: #f5f6f5; color: #24362c; font: 15px system-ui, sans-serif; }
+      h1 { font-size: 20px; }
+      #editor { margin: 24px 0; background: white; border: 1px solid #d0d6d1; }
+      .cm-editor { min-height: 220px; }
+      .cm-content { padding: 20px 0; font: 16px/1.7 Consolas, monospace; }
+      .cm-line { padding: 0 20px; }
+      button { padding: 8px 12px; }
+    </style>
+    <script src="/tests/.generated/fixture.js" defer></script>
+    <script src="/extension/engine.js" defer></script>
+    <script src="/extension/editor.js" defer></script>
+  </head>
+  <body>
+    <h1>CodeMirror 6 integration fixture</h1>
+    <p>This local page reproduces Overleaf’s editor extension events using real CodeMirror modules.</p>
+    <div id="editor"></div>
+    <button id="outside" type="button">Outside the editor</button>
+  </body>
+</html>

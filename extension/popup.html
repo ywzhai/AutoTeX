@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AutoTeX</title>
+    <link rel="stylesheet" href="popup.css">
+    <script src="popup.js" defer></script>
+  </head>
+  <body>
+    <header class="header">
+      <h1>AutoTeX</h1>
+    </header>
+
+    <main>
+      <section class="power-panel" aria-label="Extension status">
+        <div>
+          <label class="power-title" for="enabled">Inline suggestions</label>
+          <p id="connection-status" class="connection-status" role="status">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span id="connection-label">Checking the editor…</span>
+          </p>
+        </div>
+        <label class="switch">
+          <input id="enabled" type="checkbox" role="switch" aria-label="Enable inline suggestions" checked disabled>
+          <span class="switch-track" aria-hidden="true"></span>
+        </label>
+      </section>
+
+      <section class="preferences" aria-label="Suggestion settings">
+        <label class="option" for="expressions">
+          <span>Reuse expressions</span>
+          <input id="expressions" type="checkbox" checked disabled>
+        </label>
+        <label class="option" for="sequences">
+          <span>Complete indexed sequences</span>
+          <input id="sequences" type="checkbox" checked disabled>
+        </label>
+        <div class="sequence-setting">
+          <div>
+            <label for="sequence-end">Default final index</label>
+            <p id="sequence-hint">Letter or number (3–999).</p>
+          </div>
+          <input id="sequence-end" type="text" value="n" maxlength="3" autocomplete="off" spellcheck="false" aria-describedby="sequence-hint sequence-error" disabled>
+        </div>
+        <p id="sequence-error" class="error" role="alert" hidden>Enter one letter or a whole number from 3 to 999.</p>
+      </section>
+
+      <p class="shortcuts"><kbd>Tab</kbd> accept <span class="separator">·</span> <kbd>Esc</kbd> dismiss</p>
+      <p id="save-status" class="save-status" role="status" aria-live="polite"></p>
+    </main>
+  </body>
+</html>

@@ -1,0 +1,19 @@
+{
+  "name": "autotex",
+  "version": "1.1.0",
+  "private": true,
+  "description": "Local math completions for Overleaf's LaTeX source editor",
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "test:browser": "node --test tests/browser.test.cjs",
+    "package": "node scripts/package.cjs"
+  },
+  "devDependencies": {
+    "@codemirror/autocomplete": "6.18.6",
+    "@codemirror/commands": "6.8.1",
+    "@codemirror/state": "6.5.2",
+    "@codemirror/view": "6.38.1",
+    "esbuild": "0.25.9",
+    "playwright": "1.55.0"
+  }
+}

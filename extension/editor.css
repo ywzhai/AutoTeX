@@ -1,0 +1,20 @@
+.cm-editor .ol-math-ghost {
+  color: #858990;
+  opacity: 0.78;
+  font: inherit;
+  letter-spacing: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: none;
+  -webkit-user-select: none;
+  pointer-events: none;
+}
+
+.cm-editor.cm-dark .ol-math-ghost,
+.cm-editor[class*="dark"] .ol-math-ghost {
+  color: #a0a5ae;
+}
+
+@media (forced-colors: active) {
+  .cm-editor .ol-math-ghost { color: GrayText; opacity: 1; }
+}
