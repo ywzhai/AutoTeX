@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Math Autocomplete for Overleaf</title>
+    <link rel="stylesheet" href="popup.css">
+    <script src="popup.js" defer></script>
+  </head>
+  <body>
+    <header class="header">
+      <div class="brand-mark" aria-hidden="true">∑</div>
+      <div>
+        <p class="eyebrow">OVERLEAF COMPANION</p>
+        <h1>Math Autocomplete</h1>
+      </div>
+    </header>
+
+    <main>
+      <section class="power-panel" aria-label="Extension status">
+        <div>
+          <label class="power-title" for="enabled">Inline suggestions</label>
+          <p id="connection-status" class="connection-status" role="status">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span id="connection-label">Checking the editor…</span>
+          </p>
+        </div>
+        <label class="switch">
+          <input id="enabled" type="checkbox" role="switch" aria-label="Enable inline suggestions" checked disabled>
+          <span class="switch-track" aria-hidden="true"></span>
+        </label>
+      </section>
+
+      <div class="preview" aria-label="Example: typed x subscript 1 and x subscript 2, with the rest of the sequence shown as an inline suggestion">
+        <span class="preview-caption">LESS RETYPING. MORE MATH.</span>
+        <code>{x_1,x_2<span class="ghost">,\ldots,x_n}</span></code>
+        <p><kbd>Tab</kbd> accept <span class="separator">·</span> <kbd>Esc</kbd> dismiss</p>
+      </div>
+
+      <section class="preferences" aria-labelledby="preferences-title">
+        <h2 id="preferences-title">SUGGESTIONS</h2>
+        <label class="option" for="expressions">
+          <span>
+            <strong>Reuse expressions</strong>
+            <span class="description">Complete math you have already written.</span>
+          </span>
+          <input id="expressions" type="checkbox" checked disabled>
+        </label>
+        <label class="option" for="sequences">
+          <span>
+            <strong>Extend indexed sequences</strong>
+            <span class="description">Continue patterns like <code>x_1,x_2,…</code></span>
+          </span>
+          <input id="sequences" type="checkbox" checked disabled>
+        </label>
+        <div class="sequence-setting">
+          <div>
+            <label for="sequence-end">Default final index</label>
+            <p id="sequence-hint">A letter, or a number from 3 to 999.</p>
+          </div>
+          <input id="sequence-end" type="text" value="n" maxlength="3" autocomplete="off" spellcheck="false" aria-describedby="sequence-hint sequence-error" disabled>
+        </div>
+        <p id="sequence-error" class="error" role="alert" hidden>Enter one letter or a whole number from 3 to 999.</p>
+      </section>
+
+      <p id="save-status" class="save-status" role="status" aria-live="polite">Settings apply automatically.</p>
+      <div class="tip"><span aria-hidden="true">↳</span><p>In Overleaf’s code editor, start a math expression or an indexed list to see a suggestion.</p></div>
+    </main>
+
+    <footer>
+      <span class="privacy-mark" aria-hidden="true">●</span>
+      <p>Local suggestions. No document text is uploaded.<br><span>Unofficial extension · Not affiliated with Overleaf.</span></p>
+    </footer>
+  </body>
+</html>
