@@ -39,12 +39,35 @@ $\partial ${letter} / \partial t = ${index + 9}${letter} + ${index + 3}$.
 
 test('training CLI rejects ambiguous or invalid arguments', () => {
   assert.equal(Training.parseArguments(['--help']).help, true);
-  assert.throws(() => Training.parseArguments([]), /--input/);
+  const defaults = Training.parseArguments([]);
+  assert.equal(defaults.input, path.resolve(__dirname, '../dataset'));
+  assert.equal(defaults.output, path.resolve(__dirname, '../artifacts/model.json'));
+  assert.equal(Training.parseArguments(['--prepare']).output, path.resolve(__dirname, '../artifacts/prepared.json'));
+  const overrides = Training.parseArguments(['--input', 'data with spaces', '--output', 'custom output.json']);
+  assert.equal(overrides.input, 'data with spaces');
+  assert.equal(overrides.output, 'custom output.json');
+  assert.throws(() => Training.parseArguments(['--input']), /Missing value/);
   assert.throws(() => Training.parseArguments(['--unknown']), /Unknown/);
   assert.throws(() => Training.parseArguments(['--input', 'data', '--output', 'model.js']), /\.json/);
   assert.throws(() => Training.parseArguments(['--input', 'data', '--output', 'model.json', '--order', '6']), /between 1 and 5/);
   assert.throws(() => Training.parseArguments(['--input', 'data', '--output', 'model.json', '--epochs', 'NaN']), /integer/);
   assert.throws(() => Training.parseArguments(['--input', 'data', '--output', 'model.json', '--prepare', '--browser-output', 'model.js']), /cannot/);
+});
+
+test('separate folders with main.tex names and spaces remain distinct document families', (t) => {
+  const directory = temporary(t);
+  const input = path.join(directory, 'dataset with spaces');
+  for (const [index, name] of ['Answer One', 'Answer Two', 'Answer Three', 'Answer Four'].entries()) {
+    write(input, name + '/main.tex', '$x=' + (index + 1) + '$');
+  }
+  const corpus = Training.loadCorpus(input, Training.DEFAULTS);
+  assert.equal(corpus.documents.length, 4);
+  assert.equal(corpus.duplicateDocuments, 0);
+  assert.deepEqual(corpus.documents.map((document) => document.relative).sort(),
+    ['Answer Four/main.tex', 'Answer One/main.tex', 'Answer Three/main.tex', 'Answer Two/main.tex']);
+  const grouped = Training.splitCorpus(corpus, Training.DEFAULTS.seed);
+  assert.equal(grouped.groupCount, 4);
+  assert.ok(Object.values(grouped.splits).every((documents) => documents.length === 1));
 });
 
 test('corpus extraction excludes prose, comments, literals and prose commands inside math', (t) => {
@@ -84,6 +107,50 @@ test('exact duplicates, near duplicates and project families never cross splits'
   const repeat = Training.splitCorpus(corpus, 42);
   assert.deepEqual(Object.values(grouped.splits).map((docs) => docs.map((doc) => doc.mathHash)),
     Object.values(repeat.splits).map((docs) => docs.map((doc) => doc.mathHash)));
+});
+
+test('contained substantial excerpts stay together while lower-overlap documents remain independent', (t) => {
+  const directory = temporary(t);
+  const terms = (symbol, count, offset = 0) => Array.from({ length: count }, (_, i) => '$' + symbol + '_{' + (i + offset) + '}$').join('\n');
+  const excerpt = terms('q', 35);
+  write(directory, 'short/main.tex', excerpt);
+  write(directory, 'long/main.tex', excerpt + '\n' + terms('r', 130));
+  write(directory, 'lower-overlap/main.tex', terms('q', 27) + '\n' + terms('w', 18));
+  write(directory, 'independent-a.tex', '$a=1$');
+  write(directory, 'independent-b.tex', '$b=2$');
+  write(directory, 'independent-c.tex', '$c=3$');
+  const corpus = Training.loadCorpus(directory, Training.DEFAULTS);
+  assert.equal(corpus.documents.length, 6, 'retain both the short and long documents');
+  const grouped = Training.splitCorpus(corpus, 42);
+  assert.equal(grouped.groupCount, 5, 'only the contained short/long pair merges');
+  const splitFor = (result, filename) => Object.entries(result.splits).find(([, documents]) => documents.some((doc) => doc.relative === filename))[0];
+  assert.equal(splitFor(grouped, 'short/main.tex'), splitFor(grouped, 'long/main.tex'));
+  assert.ok(Array.from({ length: 12 }, (_, seed) => Training.splitCorpus(corpus, seed))
+    .some((result) => splitFor(result, 'lower-overlap/main.tex') !== splitFor(result, 'short/main.tex')),
+  'a document with substantially lower containment remains an independent family');
+});
+
+test('reordered shared formulas do not pass the excerpt containment guard', (t) => {
+  const directory = temporary(t);
+  const equations = Array.from({ length: 35 }, (_, i) => '$q_{' + i + '}$');
+  const extra = Array.from({ length: 130 }, (_, i) => '$r_{' + i + '}$');
+  write(directory, 'short.tex', equations.join('\n'));
+  write(directory, 'reordered-long.tex', [...equations].reverse().concat(extra).join('\n'));
+  write(directory, 'independent-a.tex', '$a=1$');
+  write(directory, 'independent-b.tex', '$b=2$');
+  const corpus = Training.loadCorpus(directory, Training.DEFAULTS);
+  assert.equal(Training.splitCorpus(corpus, 42).groupCount, 4);
+});
+
+test('a few shared formulas do not trigger containment grouping', (t) => {
+  const directory = temporary(t);
+  const terms = (count) => Array.from({ length: count }, (_, i) => 'v_{' + i + '}').join('+');
+  write(directory, 'short.tex', '$' + terms(6) + '$');
+  write(directory, 'long.tex', '$' + terms(100) + '$');
+  write(directory, 'independent-a.tex', '$a=1$');
+  write(directory, 'independent-b.tex', '$b=2$');
+  const corpus = Training.loadCorpus(directory, Training.DEFAULTS);
+  assert.equal(Training.splitCorpus(corpus, 42).groupCount, 4);
 });
 
 test('training refuses insufficient independent families', (t) => {
@@ -143,10 +210,15 @@ test('prepare and train produce reproducible validated artifacts without copying
   assert.equal(prepared.preparation.documents, 8);
   assert.equal(prepared.artifact, undefined);
   const generationArtifacts = [];
-  const first = Training.train(options, { generateExamples(documents, artifact, settings) {
+  const progress = [];
+  const first = Training.train(options, { onProgress: (message) => progress.push(message), generateExamples(documents, artifact, settings) {
     generationArtifacts.push(artifact);
     return Training.generateExamples(documents, artifact, settings);
   } });
+  assert.match(progress[0], /Reading LaTeX/);
+  assert.ok(progress.some((message) => message.includes('Loaded 8 mathematical documents')));
+  assert.match(progress.at(-1), /Writing model/);
+  assert.doesNotMatch(progress.join(' '), /\\begin|\\frac|\\sum/);
   assert.deepEqual(generationArtifacts.map((artifact) => artifact.trained), [false, true, true],
     'validation and test shortlists use the fitted deployment ranker');
   assert.deepEqual(generationArtifacts[1].ranker, first.artifact.ranker);

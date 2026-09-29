@@ -1,6 +1,6 @@
 # Training AutoTeX
 
-AutoTeX is ready for a user-supplied collection of LaTeX documents. The checked-in model is explicitly **untrained**: it contains no fabricated corpus statistics or learned ranking weights. Before training, document-local predictions and the existing expression/sequence providers remain available.
+AutoTeX trains on local LaTeX documents. The starter model is explicitly **untrained**; the training command produces actual corpus statistics and learned ranking weights. Until a trained artifact is installed, document-local predictions and the existing expression/sequence providers remain available.
 
 Training runs offline with Node.js and uses the exact tokenizer, candidate providers, feature extraction, and artifact validator used by the extension. It requires no Python packages, GPU, service, or network connection. The trainer reads `.tex` files as text and never executes TeX, expands macros, or follows `\input` commands. Document source stays on the machine where training is run.
 
@@ -13,7 +13,7 @@ Training runs offline with Node.js and uses the exact tokenizer, candidate provi
 
 ## Arrange the dataset
 
-Use a directory containing `.tex` files. Files are discovered recursively. A top-level directory represents one document family/project, so chapters and paper versions stay in the same split:
+By default, use this repository's `dataset/` directory. Files are discovered recursively, so the current layout of 25 subfolders, each containing `main.tex`, works directly without renaming or moving files. Repeated `main.tex` basenames remain distinct because the trainer uses relative paths; folder names and paths may contain spaces. A top-level directory represents one document family/project, so chapters and paper versions stay in the same split:
 
 ```text
 dataset/
@@ -27,7 +27,7 @@ dataset/
   probability.tex
 ```
 
-Independent flat files are separate families. Do not place unrelated projects beneath a single extra wrapper directory when passing `--input`; point the command at their common parent instead. The trainer also groups identical mathematical content and near-duplicate token sequences across directories. It retains variable names when comparing documents. This grouping is deliberately conservative but is not a guarantee against every form of dataset leakage; inspect paper versions and templates before training.
+Independent flat files are separate families. Do not place unrelated projects beneath a single extra wrapper directory when passing `--input`; point the command at their common parent instead. The trainer also groups identical mathematical content and related versions across directories. It retains variable names when comparing sequences of five consecutive math tokens, ignoring whitespace. Files are grouped when their unique-token-sequence Jaccard similarity is at least 85%, or when the smaller sequence set contains at least 100 distinct sequences and at least 90% of them also occur in the larger file, with an additional ordering check: the shorter document must have at least 10 math segments of five or more tokens, and at least 90% of those segments must appear in the same order in the longer document. The second rule keeps substantial excerpts and shorter revisions with their longer versions even when their overall lengths differ greatly. Non-identical documents remain in the corpus; grouping only keeps them in the same split. A handful of shared formulas does not meet the containment rule. Preparation/training metadata records these thresholds. These are conservative heuristics rather than a guarantee against every form of dataset leakage; inspect paper versions and templates before training.
 
 At least **four distinct families** must remain after grouping: one each for the n-gram, ranker, validation, and test sets. Four is only a smoke-test minimum. Use substantially more varied documents to obtain meaningful results. Include the list-based answers, notation, and topics expected in actual use. Fragments without explicit math delimiters/environments are ignored rather than guessed to be mathematics. Each file is parsed independently, so math environments split across separate files are not reconstructed.
 
@@ -38,20 +38,20 @@ Use documents you are permitted to use. Model counts can retain sequences of tra
 From the repository root:
 
 ```powershell
-node scripts/train-model.cjs --input "C:\path\to\dataset" --output "artifacts\prepared.json" --prepare
+npm run model:prepare
 ```
 
-This checks mathematical extraction, removes exact duplicates, groups related documents, and writes deterministic split metadata. It does **not** train or modify the extension. The output lists source/math hashes rather than document contents. Comments, verbatim regions, ordinary prose, and `\text` arguments do not become n-gram training sequences.
+This reads `dataset/` and writes `artifacts/prepared.json`, checks mathematical extraction, removes exact duplicates, and groups related documents into deterministic splits. It does **not** train or modify the extension. The output lists source/math hashes rather than document contents. Comments, verbatim regions, ordinary prose, and `\text` arguments do not become n-gram training sequences.
 
 The default split is approximately 60% n-gram training, 20% ranker training, 10% validation, and 10% final test, allocated by document-family count. Very small corpora reserve at least one family per split. Family sizes can differ, so percentages of actual files/tokens can differ. The seed and input contents determine the split; adding/removing documents may change it.
 
 ## Train and evaluate
 
 ```powershell
-node scripts/train-model.cjs --input "C:\path\to\dataset" --output "artifacts\model.json" --seed 1729
+npm run model:train
 ```
 
-The command produces:
+The command reads `dataset/` and produces:
 
 - `artifacts/model.json`: schema version 1, tokenizer version, pruned n-gram tables, ranker coefficients/scaling, and training provenance.
 - `artifacts/model.report.json`: serialized JSON model size in bytes, split counts, and held-out simulated-typing metrics, including candidate coverage, matching/mismatching displays, and matching characters.
@@ -70,10 +70,10 @@ These are **simulated append** measurements. They do not prove mathematical corr
 
 ## Install a trained artifact
 
-Once the report is acceptable, rerun the same training command with a browser export:
+Once the report is acceptable, rerun training with a browser export:
 
 ```powershell
-node scripts/train-model.cjs --input "C:\path\to\dataset" --output "artifacts\model.json" --seed 1729 --browser-output "extension\model.js"
+npm run model:train -- --browser-output "extension\model.js"
 ```
 
 This replaces the untrained `extension/model.js` with a bundle exporting `AutoTexModel`. JSON remains the source artifact; the browser bundle has equivalent data and CommonJS support for tests. The tokenizer version and feature schema must match the runtime. Reload the unpacked extension and refresh the Overleaf page after replacing the model. Run `npm test`, `npm run test:browser`, and `npm run package` before sharing a new package.
@@ -82,10 +82,18 @@ Keep the original untrained model file in version control so you can restore it 
 
 ## Training controls
 
-Run `node scripts/train-model.cjs --help` for all options.
+Run `node scripts/train-model.cjs --help` for all options. Omitted input/output paths are anchored to this repository, even if the script is invoked from another working directory. Explicit `--input` and `--output` paths still override them; quote paths containing spaces:
+
+```powershell
+npm run model:train -- --input "C:\other dataset" --output "artifacts\comparison.json" --seed 1729
+```
+
+The CLI prints stage names and aggregate counts during preparation/training, without printing document contents.
 
 | Option | Default | Purpose |
 | --- | ---: | --- |
+| `--input` | `dataset/` | Recursive dataset directory |
+| `--output` | `artifacts/model.json` | Model output; `artifacts/prepared.json` with `--prepare` |
 | `--seed` | 1729 | Reproducible grouping assignment, sample selection, and optimization |
 | `--order` | 5 | Maximum n-gram order; supported range 1–5 |
 | `--min-count` | 2 | Prune rare counts |

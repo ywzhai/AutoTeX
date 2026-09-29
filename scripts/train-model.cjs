@@ -11,7 +11,11 @@ const { createEngine } = require('../extension/engine.js');
 
 const DEFAULTS = Object.freeze({ seed: 1729, order: 5, minCount: 2, maxContexts: 12000,
   maxSuccessors: 16, maxSamples: 64, epochs: 40, maxDocumentBytes: 5000000 });
+const REPOSITORY_ROOT = path.resolve(__dirname, '..');
 const SPLITS = ['train', 'rank', 'validation', 'test'];
+const GROUPING = Object.freeze({ version: 2, shingleSize: 5, jaccard: 0.85,
+  minimumContainmentShingles: 100, containment: 0.9,
+  minimumSegmentTokens: 5, minimumContainedSegments: 10, orderedSegmentCoverage: 0.9 });
 const sha = (text) => crypto.createHash('sha256').update(text).digest('hex');
 const lexical = (a, b) => a < b ? -1 : a > b ? 1 : 0;
 
@@ -55,7 +59,8 @@ function parseArguments(args) {
     }
   }
   if (options.help) return options;
-  if (!options.input || !options.output) throw new Error('Provide --input <dataset directory> and --output <model.json>.');
+  options.input ||= path.join(REPOSITORY_ROOT, 'dataset');
+  options.output ||= path.join(REPOSITORY_ROOT, 'artifacts', options.prepare ? 'prepared.json' : 'model.json');
   if (options.order > 5) throw new Error('--order must be between 1 and 5.');
   if (options.maxContexts > 100000) throw new Error('--max-contexts must not exceed 100000.');
   if (options.maxSuccessors > 128) throw new Error('--max-successors must not exceed 128.');
@@ -89,7 +94,9 @@ function tokenKey(text) {
 
 function shingles(tokens) {
   const result = new Set();
-  for (let i = 0; i + 5 <= tokens.length; i++) result.add(sha(JSON.stringify(tokens.slice(i, i + 5))).slice(0, 16));
+  for (let i = 0; i + GROUPING.shingleSize <= tokens.length; i++) {
+    result.add(sha(JSON.stringify(tokens.slice(i, i + GROUPING.shingleSize))).slice(0, 16));
+  }
   return result;
 }
 
@@ -127,8 +134,36 @@ function loadCorpus(input, options = DEFAULTS) {
   return { documents, emptyDocuments, duplicateDocuments };
 }
 
+function orderedCoverage(shorter, longer) {
+  if (shorter.length < GROUPING.minimumContainedSegments) return 0;
+  const positions = new Map();
+  longer.forEach((key, index) => {
+    if (!positions.has(key)) positions.set(key, []);
+    positions.get(key).push(index);
+  });
+  // Longest common subsequence via an increasing sequence of matching positions.
+  // Reverse each occurrence list so one short segment cannot match more than once.
+  const tails = [];
+  for (const key of shorter) {
+    const matches = positions.get(key) || [];
+    for (let index = matches.length - 1; index >= 0; index--) {
+      const position = matches[index];
+      let low = 0, high = tails.length;
+      while (low < high) {
+        const middle = (low + high) >>> 1;
+        if (tails[middle] < position) low = middle + 1;
+        else high = middle;
+      }
+      tails[low] = position;
+    }
+  }
+  return tails.length / shorter.length;
+}
+
 function splitCorpus(corpus, seed) {
   const documents = corpus.documents.slice().sort((a, b) => lexical(a.mathHash, b.mathHash));
+  const segmentKeys = documents.map((document) => document.segments.map((segment) => tokenKey(segment.text))
+    .filter((tokens) => tokens.length >= GROUPING.minimumSegmentTokens).map((tokens) => sha(JSON.stringify(tokens))));
   const parent = documents.map((_, index) => index);
   const find = (index) => {
     while (index !== parent[index]) { parent[index] = parent[parent[index]]; index = parent[index]; }
@@ -150,8 +185,19 @@ function splitCorpus(corpus, seed) {
       for (const previous of postings.get(shingle) || []) intersections.set(previous, (intersections.get(previous) || 0) + 1);
     }
     for (const [previous, common] of intersections) {
-      const union = current.size + documentShingles[previous].size - common;
-      if (union && common / union >= 0.85) unite(index, previous);
+      const previousSize = documentShingles[previous].size;
+      const union = current.size + previousSize - common;
+      const smaller = Math.min(current.size, previousSize);
+      // Excerpts and shorter revisions can have low Jaccard similarity despite
+      // nearly all their content appearing in a longer document. Require enough
+      // distinct shingles to avoid grouping files for a few common formulas.
+      const nearDuplicate = union > 0 && common / union >= GROUPING.jaccard;
+      const shortIndex = current.size <= previousSize ? index : previous;
+      const longIndex = shortIndex === index ? previous : index;
+      const containedVersion = smaller >= GROUPING.minimumContainmentShingles &&
+        common / smaller >= GROUPING.containment &&
+        orderedCoverage(segmentKeys[shortIndex], segmentKeys[longIndex]) >= GROUPING.orderedSegmentCoverage;
+      if (nearDuplicate || containedVersion) unite(index, previous);
     }
     documentShingles.push(current);
     for (const shingle of current) {
@@ -311,7 +357,7 @@ function tuneThreshold(samples, ranker) {
 
 function summarize(corpus, grouped, options) {
   return { format: 'autotex-corpus-preparation-v1', tokenizerVersion: Predictor.TOKENIZER_VERSION,
-    seed: options.seed, documents: corpus.documents.length, families: grouped.groupCount,
+    seed: options.seed, grouping: GROUPING, documents: corpus.documents.length, families: grouped.groupCount,
     duplicateDocuments: corpus.duplicateDocuments, emptyDocuments: corpus.emptyDocuments,
     splits: Object.fromEntries(SPLITS.map((name) => [name, { documents: grouped.splits[name].length,
       sourceHashes: grouped.splits[name].map((document) => document.sourceHash).sort(),
@@ -325,23 +371,32 @@ function writeJson(filename, value) {
 
 function train(options, dependencies = {}) {
   const collectExamples = dependencies.generateExamples || generateExamples;
+  const onProgress = dependencies.onProgress || (() => {});
+  onProgress('Reading LaTeX documents...');
   const corpus = loadCorpus(options.input, options);
+  onProgress('Loaded ' + corpus.documents.length + ' mathematical documents; removed ' + corpus.duplicateDocuments + ' duplicates and skipped ' + corpus.emptyDocuments + ' files without mathematics.');
   const grouped = splitCorpus(corpus, options.seed);
   const preparation = summarize(corpus, grouped, options);
+  onProgress('Split ' + grouped.groupCount + ' document families: ' + SPLITS.map((name) => name + '=' + grouped.splits[name].length).join(', ') + '.');
   if (options.prepare) { writeJson(options.output, preparation); return { preparation }; }
   const segments = grouped.splits.train.flatMap((document) => document.segments.map((segment) => segment.text));
   const trainingTokens = segments.reduce((sum, segment) => sum + Predictor.tokenize(segment).length, 0);
+  onProgress('Building order-' + options.order + ' n-grams from ' + trainingTokens + ' tokens...');
   const ngrams = Predictor.buildNgrams(segments, { order: options.order, smoothing: 3,
     minCount: options.minCount, maxContexts: options.maxContexts, maxSuccessors: options.maxSuccessors,
     maxTokens: trainingTokens });
   const initial = { schemaVersion: 1, trained: false, tokenizerVersion: Predictor.TOKENIZER_VERSION, ngrams, ranker: null };
   if (!Predictor.validateArtifact(initial)) throw new Error('Generated n-gram artifact failed runtime validation.');
+  onProgress('Generating ranker examples from ' + grouped.splits.rank.length + ' documents...');
   const rankSamples = collectExamples(grouped.splits.rank, initial, options);
+  onProgress('Fitting ranker from ' + rankSamples.examples.length + ' sampled cursors...');
   const fitted = trainRanker(rankSamples.examples, options);
   // Candidate generation itself ranks/truncates its beam. Evaluate with the fitted
   // ranker already installed, exactly as the deployed extension generates its shortlist.
   const fittedArtifact = { ...initial, trained: true, ranker: fitted.ranker };
+  onProgress('Collecting validation examples from ' + grouped.splits.validation.length + ' documents...');
   const validation = collectExamples(grouped.splits.validation, fittedArtifact, options);
+  onProgress('Collecting test examples from ' + grouped.splits.test.length + ' documents...');
   const test = collectExamples(grouped.splits.test, fittedArtifact, options);
   if (!validation.examples.length || !test.examples.length) {
     throw new Error('Validation and test documents must produce candidates. Add representative mathematical documents or increase --max-samples.');
@@ -358,6 +413,7 @@ function train(options, dependencies = {}) {
     recommendedThreshold: threshold, validation: evaluate(validation, fitted.ranker, threshold),
     test: evaluate(test, fitted.ranker, threshold),
     evaluation: 'Simulated append with token-normalized prefix matching; not a mathematical-correctness or real-user-acceptance measurement.' };
+  onProgress('Writing model and held-out evaluation report...');
   writeJson(options.output, artifact);
   writeJson(options.output.replace(/\.json$/i, '.report.json'), report);
   if (options.browserOutput) {
@@ -371,8 +427,10 @@ function train(options, dependencies = {}) {
 }
 
 const HELP = `AutoTeX offline training (Node.js; no external dependencies)
-  node scripts/train-model.cjs --input <dataset directory> --output <model.json> [options]
+  node scripts/train-model.cjs [options]
 
+  --input <directory>       Dataset directory (default: this repository's dataset/)
+  --output <file.json>      Model JSON (default: artifacts/model.json; prepared.json with --prepare)
   --prepare                 Validate, deduplicate and split only; do not train
   --browser-output <file.js> Also write a browser/CommonJS model bundle
   --seed <integer>           Deterministic split/training seed (default 1729)
@@ -390,7 +448,7 @@ if (require.main === module) {
     const options = parseArguments(process.argv.slice(2));
     if (options.help) process.stdout.write(HELP);
     else {
-      const result = train(options);
+      const result = train(options, { onProgress: (message) => process.stdout.write(message + '\n') });
       if (result.preparation) process.stdout.write('Prepared ' + result.preparation.documents + ' documents in ' + result.preparation.families + ' families. No model trained.\n');
       else process.stdout.write('Trained ' + result.report.ngramContexts + ' contexts and a ' + Predictor.FEATURE_NAMES.length + '-feature ranker. Model and held-out report written.\n');
     }
@@ -400,5 +458,5 @@ if (require.main === module) {
   }
 }
 
-module.exports = { DEFAULTS, parseArguments, loadCorpus, splitCorpus, samplePositions,
+module.exports = { DEFAULTS, GROUPING, parseArguments, loadCorpus, splitCorpus, samplePositions,
   generateExamples, trainRanker, probability, evaluate, train, tokenKey, candidateMatches };
