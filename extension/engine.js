@@ -296,7 +296,7 @@
 
   // The offline evaluator uses this same selection policy. Low corpus confidence
   // must not disable a concrete completion already supported by the document.
-  function selectCandidate(ranked, threshold = 0) {
+  function selectCandidate(ranked, threshold = 0, useLearnedRanking = false) {
     if (!Array.isArray(ranked) || !ranked.length) return null;
     const tier = (candidate) => candidate.itemTier ?? candidate.scopeTier ?? 0;
     const isReliable = (candidate) => candidate.reliable ||
@@ -307,6 +307,15 @@
     if (!eligible.length) return null;
     const bestTier = Math.max(...eligible.map(tier));
     const scoped = eligible.filter((candidate) => tier(candidate) === bestTier);
+    if (useLearnedRanking) {
+      // All providers participate in learned ranking. Document-supported candidates
+      // remain eligible below the generated threshold, preserving a useful fallback.
+      scoped.sort((a, b) => (b.score || 0) - (a.score || 0) ||
+        (b.semanticScore || 0) - (a.semanticScore || 0) ||
+        (b.legacyScore || 0) - (a.legacyScore || 0) ||
+        (a.insertText || '').localeCompare(b.insertText || ''));
+      return scoped[0];
+    }
     const reliable = scoped.filter(isReliable);
     reliable.sort((a, b) => (b.semanticScore || 0) - (a.semanticScore || 0) ||
       Number(b.kind === 'sequence') - Number(a.kind === 'sequence') ||
@@ -485,23 +494,26 @@
         if (!previous || candidate.itemTier > previous.itemTier ||
             (candidate.itemTier === previous.itemTier && candidate.semanticScore > previous.semanticScore)) unique.set(candidate.insertText, candidate);
       }
-      return { candidates: [...unique.values()].sort((a, b) => b.itemTier - a.itemTier).slice(0, 32), context };
+      return { candidates: predictor.prepareCandidates([...unique.values()].sort((a, b) => b.itemTier - a.itemTier).slice(0, 32), context), context };
     }
 
     return {
       collectCandidates,
+      rankCandidates(candidates, context) { return predictor.rank(candidates, context); },
       suggest(documentText, cursor, overrides) {
         const collected = collectCandidates(documentText, cursor, overrides);
         if (!collected?.candidates.length) return null;
         const ranked = predictor.rank(collected.candidates, collected.context);
         const threshold = predictor.trained && Number.isFinite(artifact?.training?.recommendedThreshold)
           ? Math.max(0, Math.min(1, artifact.training.recommendedThreshold)) : 0;
-        return selectCandidate(ranked, threshold);
+        return selectCandidate(ranked, threshold, predictor.trained);
       },
       isMathContext(documentText, cursor) {
         return typeof documentText === 'string' && Boolean(Context.contextAt(parse(documentText), cursor));
       },
       setModel(nextArtifact) { artifact = nextArtifact; predictor = Predictor.createPredictor(artifact); return predictor.valid; },
+      feedback(candidate, accepted) { return predictor.feedback(candidate, accepted); },
+      calibrationState() { return predictor.calibrationState(); },
       reset() { cachedText = undefined; cachedParse = undefined; predictor.reset(); }
     };
   }

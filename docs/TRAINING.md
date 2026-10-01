@@ -1,6 +1,6 @@
 # Training AutoTeX
 
-AutoTeX trains on local LaTeX documents. The starter model is explicitly **untrained**; the training command produces actual corpus statistics and learned ranking weights. Until a trained artifact is installed, document-local predictions and the existing expression/sequence providers remain available.
+AutoTeX trains on local LaTeX documents. Training produces corpus statistics and learned ranking weights; `extension/model.js` identifies whether a trained artifact is installed. An untrained or invalid artifact retains the rule-based expression/sequence fallback and document-local behavior where supported.
 
 Training runs offline with Node.js and uses the exact tokenizer, candidate providers, feature extraction, and artifact validator used by the extension. It requires no Python packages, GPU, service, or network connection. The trainer reads `.tex` files as text and never executes TeX, expands macros, or follows `\input` commands. Document source stays on the machine where training is run.
 
@@ -10,10 +10,15 @@ Training runs offline with Node.js and uses the exact tokenizer, candidate provi
 - The current `\item` means the body of the current list entry, from that `\item` to its next sibling or the end of its list. An optional `[label]` is a label, not the scope. Nested list entries receive their own scope; surrounding parent items are secondary context.
 - Candidates supported by the current item have priority over parent-item and other-document candidates. This policy is enforced outside learned weights so training cannot remove it. Local counts also favor the current item when proposing token continuations.
 - A bounded, smoothed token n-gram model proposes short continuations. A logistic-regression ranker scores the combined shortlist, including existing expression and indexed-sequence suggestions. Matching typed text continues consuming the displayed suggestion without requesting a new prediction.
+- Corpus likelihood and local transition evidence are measured for every candidate, including reused formulas. With a trained artifact, learned scores choose among all eligible providers inside the winning item tier. Document-supported candidates remain eligible even below the generated-suggestion threshold.
+- Corpus probabilities supply a prior before local evidence is available. Matching context counts from disjoint current-item, ancestor-item, and remaining-document buckets increase local influence as notation recurs. Unrelated local token volume does not drown a matching corpus context. The buckets avoid counting the same observation multiple times in the probability mixture.
+- Tab acceptance and explicit Esc dismissal update a bounded logistic score correction around the trained ranker. Each displayed feature snapshot can update calibration only once, including after matching type-through. Navigation, blur, different typing, composition, and Undo supply no negative label. Ordinary edits and preference changes retain calibration; a new editor/document or model replacement resets it. Feedback is neither persisted nor added to the offline dataset.
+
+Schema 3 stores the adaptation controls (`corpusPrior: 8`, `feedbackRate: 0.2`, `feedbackDecay: 0.98`, `feedbackLimit: 2`). These are engineering defaults, not parameters fitted by the trainer. Training learns the token probabilities, 18 ranking coefficients and bias, feature scaling, and validation display threshold. Those learned probabilities and scores establish the starting point for both document-content adaptation and feedback updates. Feedback features are clipped, corrections shrink toward the trained prior, and the total online logit correction is bounded to ±2.
 
 ## Arrange the dataset
 
-By default, use this repository's `dataset/` directory. Files are discovered recursively, so the current layout of 25 subfolders, each containing `main.tex`, works directly without renaming or moving files. Repeated `main.tex` basenames remain distinct because the trainer uses relative paths; folder names and paths may contain spaces. A top-level directory represents one document family/project, so chapters and paper versions stay in the same split:
+By default, use this repository's `dataset/` directory. Files are discovered recursively, so a parent directory containing one folder per paper, each with `main.tex`, works directly without renaming or moving files. Repeated `main.tex` basenames remain distinct because the trainer uses relative paths; folder names and paths may contain spaces. A top-level directory represents one document family/project, so chapters and paper versions stay in the same split:
 
 ```text
 dataset/
@@ -53,21 +58,21 @@ npm run model:train
 
 The command reads `dataset/` and produces:
 
-- `artifacts/model.json`: schema version 2, tokenizer/classifier versions, pruned n-gram tables, 18-feature ranker coefficients/scaling, and training provenance.
-- `artifacts/model.report.json`: serialized JSON model size in bytes, split counts, and held-out simulated-typing metrics, including candidate coverage, matching/mismatching displays, and matching characters. Reports include per-category results (index, set, algebra, function, scalar, unknown), document-supported versus generated outcomes, and the validation-only threshold curve.
+- `artifacts/model.json`: schema version 3, tokenizer/classifier versions, pruned n-gram tables, 18-feature ranker coefficients/scaling, adaptation controls, and training provenance.
+- `artifacts/model.report.json`: serialized JSON model size in bytes, split counts, and held-out simulated-typing metrics, including candidate coverage, matching/mismatching displays, and matching characters. Reports include per-category results (index, set, algebra, function, scalar, unknown), document-supported versus generated outcomes, first-formula (`cold`) versus later-formula (`warm`) results, an untrained baseline on the same test cursors, and the validation-only threshold curve.
 
 Training proceeds as follows:
 
-1. Count token sequences of orders 1–5 using only the n-gram split. The shared tokenizer preserves control words, individual ordinary math letters, digit runs, braces, and normalized whitespace. Prune rare context/successor counts to bound the artifact.
+1. Count token sequences of orders 1–5 using only the n-gram split. The shared tokenizer preserves control words, individual ordinary math letters, digit runs, braces, and normalized whitespace. A bounded Misra–Gries pass selects candidate contexts across the full training split, then a second pass recounts their successors exactly. Selection is approximate, exported counts are exact, and later documents can introduce frequent contexts even after the working table fills. Prune rare context/successor counts to bound the artifact.
 2. Classify the visible cursor context using deterministic syntax and scoped symbol evidence. The classifier is a small rules engine, not a separately trained neural network. It distinguishes object context from an unfinished subscript and adds category compatibility, index fit, and symbol-type compatibility to the original 15 ranking features.
 3. Sample append cursors from the separate ranker split, including positions inside command words and multi-digit numbers. For each sample, give candidate generation **only the document prefix up to the cursor**. Hidden target text and all later text are absent from retrieval and local counts. Never index the hidden answer.
-4. Label a candidate positive when its tokens match a prefix of the hidden continuation, ignoring ordinary whitespace. Collect the shared features from all candidate providers. Fit feature means/scales on ranker examples only, then train an L2-regularized logistic model with deterministic stochastic gradient descent.
+4. Label a candidate positive when its tokens match a prefix of the hidden continuation, ignoring ordinary whitespace. Collect the shared features from all candidate providers, including corpus/local likelihood for reused formulas. Fit feature means/scales on ranker examples only, then train an L2-regularized logistic model with deterministic stochastic gradient descent.
 5. Install the fitted ranker into candidate generation before collecting validation/test examples, matching the deployed shortlist selection. Use the validation split to choose a display threshold for generated suggestions. Existing formula/sequence reuse and observed indices for the same base symbol bypass that learned gate; both the runtime and evaluator call the same selection helper. The current-item tier still takes precedence. The initial utility is matching characters minus 16 for each mismatching display; this is a tunable product choice, not a measured user-cost estimate.
 6. Evaluate once on the separate test split using the chosen threshold. The test split never trains counts, coefficients, scaling, or the threshold.
 
 If the ranker sees no positive or no negative examples, training fails with a clear error. Add varied documents or raise `--max-samples`; do not turn fabricated weights into a supposedly trained artifact. Validation/test documents must also produce candidates.
 
-These are **simulated append** measurements. They do not prove mathematical correctness, predict real Tab acceptance, or cover every middle-of-document edit. Existing browser tests cover editor integration; testing the trained artifact interactively on representative documents is still required. Evaluate cold startup, memory, and p50/p95 keystroke-to-visible latency separately on target laptops before distributing a model. The intended latency budget is a goal, not a benchmark result.
+These are **simulated append** measurements. The `cold`/`warm` breakdown measures the initial trained scorer with different amounts of visible document text; no acceptance/rejection feedback is simulated. It does not establish the quality or probability calibration of later personalized scores. These metrics do not prove mathematical correctness, predict real Tab acceptance, or cover every middle-of-document edit. Existing browser tests cover editor integration; testing the trained artifact interactively on representative documents is still required. Evaluate cold startup, memory, and p50/p95 keystroke-to-visible latency separately on target laptops before distributing a model. The intended latency budget is a goal, not a benchmark result.
 
 ## Install a trained artifact
 
@@ -77,9 +82,9 @@ Once the report is acceptable, rerun training with a browser export:
 npm run model:train -- --browser-output "extension\model.js"
 ```
 
-This replaces the untrained `extension/model.js` with a bundle exporting `AutoTexModel`. JSON remains the source artifact; the browser bundle has equivalent data and CommonJS support for tests. The tokenizer version, classifier version, and feature schema must match the runtime. Trained schema-1 artifacts are rejected and must be retrained for the new 18-feature schema; an untrained schema-1 placeholder is accepted for migration. Reload the unpacked extension and refresh the Overleaf page after replacing the model. Run `npm test`, `npm run test:browser`, and `npm run package` before sharing a new package.
+This replaces `extension/model.js` with a bundle exporting `AutoTexModel`. JSON remains the source artifact; the browser bundle has equivalent data and CommonJS support for tests. The tokenizer version, classifier version, and feature schema must match the runtime. Trained schema-1/2 artifacts are rejected and must be retrained because schema 3 changes feature evidence and selection; untrained schema-1/2 placeholders are accepted for migration. Reload the unpacked extension and refresh the Overleaf page after replacing the model. Run `npm test`, `npm run test:browser`, and `npm run package` before sharing a new package.
 
-Keep the original untrained model file in version control so you can restore it if a trained model performs poorly. Do not commit the dataset by default; keep its location outside the repository or explicitly ignore it.
+Keep a previous model in version history so you can restore it if retraining performs poorly. Do not commit the dataset by default; keep its location outside the repository or explicitly ignore it.
 
 ## Classifier scope and limitations
 
@@ -109,6 +114,8 @@ The CLI prints stage names and aggregate counts during preparation/training, wit
 | `--max-samples` | 64 | Maximum sampled cursors per document |
 | `--epochs` | 40 | Ranker optimization passes |
 | `--max-document-bytes` | 5000000 | Fail clearly on unexpectedly large input files |
+
+For a corpus of thousands of papers, `--max-samples 16` is a practical first run. This limits simulated cursors for ranking/evaluation only; n-gram counting still processes every token in the count-training split. Preparation uses compact shingle storage and exact similarity checks to keep project grouping within memory limits.
 
 The candidate generator separately bounds its beam, completion length, and context budget for runtime speed. More training data need not mean a larger shipped model: retain pruning limits and compare held-out coverage against artifact size and browser latency. Increasing the number of epochs cannot compensate for missing useful candidates or an unrepresentative dataset.
 

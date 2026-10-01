@@ -7,6 +7,7 @@ const http = require("node:http");
 const path = require("node:path");
 const { build } = require("esbuild");
 const { chromium } = require("playwright");
+const Predictor = require("../extension/predictor.js");
 
 const root = path.resolve(__dirname, "..");
 const ghostSelector = ".ol-math-ghost";
@@ -72,10 +73,14 @@ async function fixture(t, options = {}) {
     await context.close();
     assert.deepEqual(errors, [], "The fixture should have no uncaught browser errors");
   });
-  if (Object.hasOwn(options, "modelArtifact")) {
+  // Pin exact-behavior fixtures to the baseline model. A newly trained corpus
+  // can legitimately choose different text; the bundled-model test below covers
+  // loading and accepting suggestions from the installed artifact separately.
+  if (Object.hasOwn(options, "modelArtifact") || !options.bundledModel) {
+    const model = Object.hasOwn(options, "modelArtifact") ? options.modelArtifact : Predictor.createUntrainedArtifact();
     await page.route("**/extension/model.js", (route) => route.fulfill({
       contentType: "text/javascript",
-      body: "globalThis.AutoTexModel = " + JSON.stringify(options.modelArtifact) + ";",
+      body: "globalThis.AutoTexModel = " + JSON.stringify(model) + ";",
     }));
   }
   await page.goto(`${baseURL}/tests/fixture.html`);
@@ -106,6 +111,166 @@ async function noGhost(page) {
   await page.waitForTimeout(120);
   assert.equal(await page.locator(ghostSelector).count(), 0);
 }
+
+async function observeFeedback(page) {
+  await page.evaluate(() => {
+    window.fixture.feedbackSessions = [];
+    const create = window.MathAutocompleteEngine.createEngine;
+    window.MathAutocompleteEngine.createEngine = (...args) => {
+      const engine = create(...args);
+      const session = { engine, events: [], resets: 0, snapshot: null };
+      window.fixture.feedbackSessions.push(session);
+      const suggest = engine.suggest;
+      engine.suggest = (...values) => {
+        const candidate = suggest(...values);
+        session.snapshot = candidate?._feedback;
+        return candidate;
+      };
+      const feedback = engine.feedback;
+      engine.feedback = (candidate, accepted) => {
+        const snapshot = candidate._feedback;
+        const result = feedback(candidate, accepted);
+        session.events.push({
+          accepted,
+          insertText: candidate.insertText,
+          sameSnapshot: snapshot === session.snapshot,
+          featureCount: snapshot?.features?.length,
+          finiteFeatures: snapshot?.features?.every(Number.isFinite),
+          result,
+        });
+        return result;
+      };
+      const reset = engine.reset;
+      engine.reset = () => { session.resets++; reset(); };
+      return engine;
+    };
+  });
+}
+
+async function feedbackSessions(page) {
+  return page.evaluate(() => window.fixture.feedbackSessions.map(({ engine, events, resets }) => ({
+    events, resets, state: engine.calibrationState(),
+  })));
+}
+
+test("the installed model loads, offers a real completion, and learns from its acceptance", async (t) => {
+  const page = await fixture(t, { bundledModel: true });
+  assert.equal(await page.evaluate(() => window.AutoTexPredictor.validateArtifact(window.AutoTexModel)), true);
+  await observeFeedback(page);
+  const before = await setDocument(page, "$a^2 + b^2 = c^2$\n$a^2|$");
+  const suffix = await ghostText(page);
+  assert.ok(suffix.trim().length > 0);
+  const position = await page.evaluate(() => window.fixture.view.state.selection.main.head);
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), before.slice(0, position) + suffix + before.slice(position));
+  await noGhost(page);
+  const [session] = await feedbackSessions(page);
+  assert.equal(session.events.length, 1);
+  assert.equal(session.events[0].accepted, true);
+  assert.equal(session.events[0].result, true);
+  assert.equal(session.events[0].finiteFeatures, true);
+  assert.equal(session.state.updates, 1);
+});
+
+test("Tab calibrates once using the original ranked features after matching typing; Undo is unlabeled", async (t) => {
+  const page = await fixture(t);
+  await observeFeedback(page);
+  await setDocument(page, "$a^2 + b^2 = c^2$\n$a^2|$");
+  await ghostText(page);
+  await page.keyboard.type(" + b");
+  assert.equal(await ghostText(page), "^2 = c^2");
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), "$a^2 + b^2 = c^2$\n$a^2 + b^2 = c^2$");
+  let [session] = await feedbackSessions(page);
+  assert.deepEqual(session.events, [{
+    accepted: true, insertText: "^2 = c^2", sameSnapshot: true,
+    featureCount: 18, finiteFeatures: true, result: true,
+  }]);
+  assert.equal(session.state.updates, 1);
+  assert.ok(session.state.weightNorm > 0, "Acceptance should update the document calibration");
+  await page.keyboard.press(process.platform === "darwin" ? "Meta+z" : "Control+z");
+  await noGhost(page);
+  [session] = await feedbackSessions(page);
+  assert.equal(session.events.length, 1, "Undo must not be interpreted as rejection");
+  assert.equal(session.state.updates, 1);
+});
+
+test("only Escape on a visible suggestion records explicit rejection", async (t) => {
+  const page = await fixture(t);
+  await observeFeedback(page);
+  const before = await setDocument(page, "$a^2 + b^2 = c^2$\n$a^2|$");
+  await ghostText(page);
+  await page.keyboard.press("Escape");
+  await noGhost(page);
+  await page.keyboard.press("Escape");
+  const [session] = await feedbackSessions(page);
+  assert.deepEqual(session.events, [{
+    accepted: false, insertText: " + b^2 = c^2", sameSnapshot: true,
+    featureCount: 18, finiteFeatures: true, result: true,
+  }]);
+  assert.equal(session.state.updates, 1);
+  assert.ok(session.state.weightNorm > 0, "Explicit rejection should update the document calibration");
+  assert.equal(await documentText(page), before);
+});
+
+test("a host editor transaction filter that blocks Tab insertion does not record acceptance", async (t) => {
+  const page = await fixture(t);
+  await observeFeedback(page);
+  await setDocument(page, "$a^2 + b^2 = c^2$\n$a^|$");
+  await page.evaluate(() => {
+    const { view, CodeMirror } = window.fixture;
+    view.dispatch({ effects: CodeMirror.StateEffect.appendConfig.of(
+      CodeMirror.EditorState.transactionFilter.of((transaction) =>
+        transaction.isUserEvent("input.complete.math") ? [] : transaction),
+    ) });
+  });
+  await page.keyboard.type("2");
+  await ghostText(page);
+  const before = await documentText(page);
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), before);
+  const [session] = await feedbackSessions(page);
+  assert.deepEqual(session.events, []);
+  assert.equal(session.state.updates, 0);
+});
+
+test("navigation, blur, divergent typing, and document switches never record rejection", async (t) => {
+  const page = await fixture(t);
+  await observeFeedback(page);
+  for (const action of ["navigation", "blur", "typing", "switch"]) {
+    await setDocument(page, "$a^2 + b^2 = c^2$\n$a^2|$");
+    await ghostText(page);
+    if (action === "navigation") await page.keyboard.press("ArrowLeft");
+    if (action === "blur") await page.getByRole("button", { name: "Outside the editor" }).click();
+    if (action === "typing") await page.keyboard.type("z");
+    if (action === "switch") await setDocument(page, "Different document|");
+    const sessions = await feedbackSessions(page);
+    assert.ok(sessions.every(({ events, state }) => events.length === 0 && state.updates === 0), action);
+  }
+});
+
+test("document calibration survives edits and preferences, and resets when switching files", async (t) => {
+  const page = await fixture(t);
+  await observeFeedback(page);
+  await setDocument(page, "$a^2 + b^2 = c^2$\n$a^2|$");
+  await ghostText(page);
+  await page.keyboard.press("Tab");
+  const [accepted] = await feedbackSessions(page);
+  assert.equal(accepted.state.updates, 1);
+  await page.keyboard.type(" ");
+  await page.evaluate(() => window.fixture.configure({ debounceMs: 45 }));
+  const [edited] = await feedbackSessions(page);
+  assert.equal(edited.resets, 0);
+  assert.deepEqual(edited.state, accepted.state, "Edits and preference changes must keep feedback in this document");
+  await setDocument(page, "$a^2 + b^2 = c^2$\n$a^2|$");
+  await ghostText(page);
+  const [previous, next] = await feedbackSessions(page);
+  assert.equal(previous.resets, 1);
+  assert.equal(previous.state.updates, 0);
+  assert.equal(next.state.updates, 0);
+  assert.equal(next.state.weightNorm, 0);
+  assert.deepEqual(next.events, []);
+});
 
 test("grey inline expression preview leaves the document untouched; Tab inserts once", async (t) => {
   const page = await fixture(t);
@@ -705,12 +870,11 @@ test("classified subscript preview accepts with Tab and preserves the paired bra
   assert.equal(await documentText(page), before);
   await page.keyboard.press("Tab");
   assert.equal(await documentText(page), "$x_{j,k}$\n$x_{j,k}$");
-  await page.keyboard.press("Control+z");
+  await page.keyboard.press(process.platform === "darwin" ? "Meta+z" : "Control+z");
   assert.equal(await documentText(page), before);
 });
 
 test("a trained low-confidence ranker retains reliable grey expression previews", async (t) => {
-  const Predictor = require("../extension/predictor.js");
   const model = { ...Predictor.createUntrainedArtifact(), trained: true,
     ranker: { features: [...Predictor.FEATURE_NAMES], weights: Predictor.FEATURE_NAMES.map(() => 0),
       means: Predictor.FEATURE_NAMES.map(() => 0), scales: Predictor.FEATURE_NAMES.map(() => 1), bias: -30 },

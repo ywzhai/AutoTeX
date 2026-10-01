@@ -231,7 +231,7 @@ test('evaluation keeps reliable completions visible and reports actual outcomes 
   assert.equal(metrics.byCategory.unknown.sampledCursors, 1);
   assert.equal(metrics.byCategory.unknown.coverage, 0);
   const selected = samples.examples.map((example) =>
-    Engine.selectCandidate(example.rows.map((candidate) => ({ ...candidate, score: Training.probability(candidate, ranker) })), 0.95));
+    Engine.selectCandidate(example.rows.map((candidate) => ({ ...candidate, score: Training.probability(candidate, ranker) })), 0.95, true));
   assert.equal(selected.filter(Boolean).length, metrics.shown);
   assert.equal(selected.filter((candidate) => candidate?.label).length, metrics.matching);
   const curve = Training.thresholdCurve(samples, ranker);
@@ -264,8 +264,8 @@ test('prepare and train produce reproducible validated artifacts without copying
   assert.ok(progress.some((message) => message.includes('Loaded 8 mathematical documents')));
   assert.match(progress.at(-1), /Writing model/);
   assert.doesNotMatch(progress.join(' '), /\\begin|\\frac|\\sum/);
-  assert.deepEqual(generationArtifacts.map((artifact) => artifact.trained), [false, true, true],
-    'validation and test shortlists use the fitted deployment ranker');
+  assert.deepEqual(generationArtifacts.map((artifact) => artifact.trained), [false, true, true, false],
+    'validation and test use the fitted ranker; the baseline starts with an empty untrained model');
   assert.deepEqual(generationArtifacts[1].ranker, first.artifact.ranker);
   assert.deepEqual(generationArtifacts[2].ranker, first.artifact.ranker);
   assert.equal(first.artifact.trained, true);
@@ -273,7 +273,14 @@ test('prepare and train produce reproducible validated artifacts without copying
   assert.equal(first.artifact.classifierVersion, Predictor.CLASSIFIER_VERSION);
   assert.deepEqual(first.artifact.ranker.features.slice(-3), ['categoryMatch', 'indexFit', 'symbolTypeMatch']);
   assert.equal(first.report.classifierVersion, first.artifact.classifierVersion);
+  assert.equal(first.report.format, 'autotex-training-report-v3');
   assert.equal(first.report.thresholdSource, 'validation');
+  assert.equal(first.report.baseline.sampledCursors, first.report.test.sampledCursors);
+  assert.deepEqual(first.report.baseline, Training.evaluate(generationSamples[3], null, 0));
+  assert.ok(first.report.test.byStage.cold.sampledCursors > 0);
+  assert.ok(first.report.test.byStage.warm.sampledCursors > 0);
+  assert.equal(first.report.test.byStage.cold.sampledCursors + first.report.test.byStage.warm.sampledCursors,
+    first.report.test.sampledCursors);
   assert.deepEqual(first.report.validationThresholdCurve, Training.thresholdCurve(generationSamples[1], first.artifact.ranker));
   assert.equal(first.report.recommendedThreshold, Training.tuneThreshold(generationSamples[1], first.artifact.ranker));
   assert.equal(Object.hasOwn(first.report, 'testThresholdCurve'), false);
@@ -298,4 +305,38 @@ test('prepare and train produce reproducible validated artifacts without copying
   assert.equal(sandbox.module.exports, sandbox.AutoTexModel);
   assert.doesNotMatch(JSON.stringify(first.report), /\\begin|\\frac|\\sum/);
   assert.equal(first.report.corpus.splits.test.documents, 1);
+});
+
+
+test('bounded corpus counting admits frequent late contexts and exports exact counts', () => {
+  const unique = Array.from({ length: 100 }, (_, index) => '\\noise' + String.fromCharCode(97 + index % 26) + String.fromCharCode(97 + Math.floor(index / 26)));
+  const segments = unique.concat(Array(80).fill(String.raw`\zeta + \eta`));
+  const options = { ...Training.DEFAULTS, order: 3, minCount: 2, maxContexts: 8 };
+  const model = Training.buildCorpusNgrams(segments, options);
+  const exact = Predictor.buildNgrams(segments, { ...options, maxContexts: 10000, maxTokens: 10000 });
+  const exactByContext = new Map(exact.contexts.map((entry) => [JSON.stringify(entry.context), entry]));
+  assert.ok(model.contexts.some((entry) => entry.context.includes('\\zeta')), 'late frequent mathematics enters the shortlist');
+  for (const entry of model.contexts) {
+    assert.deepEqual(entry, exactByContext.get(JSON.stringify(entry.context)), 'selection approximation never contaminates exported counts');
+  }
+  assert.equal(Predictor.validateArtifact(Predictor.createUntrainedArtifact(model)), true);
+  assert.deepEqual(Training.buildCorpusNgrams(segments, options), model);
+});
+
+test('simulated samples reserve initial-formula cursors and reset document state', (t) => {
+  const directory = temporary(t);
+  write(directory, 'one.tex', '$a+b+c+d+e$\n' + Array(50).fill('$f+g+h+i+j$').join('\n'));
+  write(directory, 'two.tex', '$m+n+o+p+q$\n$r+s+t+u+v$');
+  const corpus = Training.loadCorpus(directory, Training.DEFAULTS);
+  let resets = 0;
+  const engine = { reset() { resets++; }, collectCandidates(visible, cursor) {
+    assert.equal(visible.length, cursor);
+    return { candidates: [], context: { prefix: visible, classification: { kind: 'unknown' } } };
+  } };
+  const samples = Training.generateExamples(corpus.documents, Predictor.createUntrainedArtifact(),
+    { ...Training.DEFAULTS, maxSamples: 8 }, engine);
+  assert.equal(resets, 2, 'feedback and document caches cannot cross paper boundaries');
+  assert.equal(samples.sampledCursors, 16);
+  assert.ok(samples.sampledByStage.cold >= 4);
+  assert.ok(samples.sampledByStage.warm > 0);
 });

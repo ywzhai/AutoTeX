@@ -7,8 +7,10 @@
   "use strict";
 
   const TOKENIZER_VERSION = "autotex-tex-v1";
-  const SCHEMA_VERSION = 2;
+  const SCHEMA_VERSION = 3;
   const CLASSIFIER_VERSION = "autotex-context-v1";
+  const DEFAULT_ADAPTATION = Object.freeze({ version: 1, corpusPrior: 8,
+    feedbackRate: 0.2, feedbackDecay: 0.98, feedbackLimit: 2 });
   const END_TOKEN = "<eos>";
   const FEATURE_NAMES = Object.freeze([
     "ngramLogProbability", "documentEvidence", "sameItemEvidence", "ancestorEvidence",
@@ -172,12 +174,20 @@
   function validateArtifact(artifact) {
     if (!artifact || typeof artifact.trained !== "boolean" ||
         artifact.tokenizerVersion !== TOKENIZER_VERSION) return false;
-    // Only the untrained v1 format can migrate without retraining. A trained
-    // v1 ranker has a different feature layout and must never be silently reused.
-    const legacyUntrained = artifact.schemaVersion === 1 && !artifact.trained && artifact.ranker == null;
+    // Untrained v1/v2 placeholders can migrate. Trained older artifacts need
+    // retraining because their feature evidence and selection policy differ.
+    const legacyUntrained = [1, 2].includes(artifact.schemaVersion) && !artifact.trained && artifact.ranker == null;
     if (!legacyUntrained && (artifact.schemaVersion !== SCHEMA_VERSION ||
         artifact.classifierVersion !== CLASSIFIER_VERSION)) return false;
     if (!(artifact.ngrams == null && !artifact.trained) && !validNgrams(artifact.ngrams)) return false;
+    if (!legacyUntrained) {
+      const adaptation = artifact.adaptation;
+      if (!adaptation || adaptation.version !== 1 ||
+          !Number.isFinite(adaptation.corpusPrior) || adaptation.corpusPrior <= 0 || adaptation.corpusPrior > 1000 ||
+          !Number.isFinite(adaptation.feedbackRate) || adaptation.feedbackRate <= 0 || adaptation.feedbackRate > 1 ||
+          !Number.isFinite(adaptation.feedbackDecay) || adaptation.feedbackDecay <= 0 || adaptation.feedbackDecay > 1 ||
+          !Number.isFinite(adaptation.feedbackLimit) || adaptation.feedbackLimit <= 0 || adaptation.feedbackLimit > 4) return false;
+    }
     const ranker = artifact.ranker;
     if (ranker == null) return artifact.trained === false;
     if (!Array.isArray(ranker.features) || ranker.features.length !== FEATURE_NAMES.length ||
@@ -193,7 +203,7 @@
 
   function createUntrainedArtifact(ngrams = buildNgrams([])) {
     return { schemaVersion: SCHEMA_VERSION, trained: false, tokenizerVersion: TOKENIZER_VERSION,
-      classifierVersion: CLASSIFIER_VERSION, ngrams, ranker: null };
+      classifierVersion: CLASSIFIER_VERSION, ngrams, ranker: null, adaptation: { ...DEFAULT_ADAPTATION } };
   }
 
   function indexModel(model) {
@@ -208,12 +218,13 @@
         let probabilities = new Map();
         let support = new Map();
         let unigramSupport = new Map();
+        let total = 0, unigramTotal = 0;
         let longest = 0;
         for (let size = 0; size < model.order && size <= history.length; size++) {
           const suffix = size ? history.slice(-size) : [];
           const entry = entries.get(contextKey(suffix));
           if (!entry) continue;
-          if (size === 0) unigramSupport = entry.next;
+          if (size === 0) { unigramSupport = entry.next; unigramTotal = entry.total; }
           const weight = size === 0 ? 1 : entry.total / (entry.total + model.smoothing);
           probabilities = new Map([...probabilities].map(([token, probability]) => [token, probability * (1 - weight)]));
           for (const [token, count] of entry.next) {
@@ -221,10 +232,11 @@
           }
           if (size > 0 && suffix.some((token) => token !== " " && token !== "\n")) {
             longest = size;
+            total = entry.total;
             support = new Map(entry.next);
           }
         }
-        const result = { probabilities, support, unigramSupport, longest };
+        const result = { probabilities, support, unigramSupport, longest, total, unigramTotal };
         if (cached.size > 2000) cached.clear();
         cached.set(key, result);
         return result;
@@ -358,9 +370,15 @@
     const artifact = suppliedArtifact === undefined ? createUntrainedArtifact() : suppliedArtifact;
     const valid = validateArtifact(artifact);
     const corpus = valid ? indexModel(artifact.ngrams || buildNgrams([])) : null;
+    const hasCorpus = valid && (artifact.ngrams?.contexts.length || 0) > 0;
+    const adaptation = valid && artifact.adaptation || DEFAULT_ADAPTATION;
     let localCache = new WeakMap();
+    let evidenceCache = new WeakMap();
     let recentSignature;
     let recentModels;
+    let feedbackSnapshots = new WeakSet();
+    let updates = 0, onlineBias = 0;
+    let onlineWeights = FEATURE_NAMES.map(() => 0);
 
     function localModels(context) {
       const segments = Array.isArray(context.segments) ? context.segments : EMPTY_SEGMENTS;
@@ -388,30 +406,133 @@
         const current = context.itemId == null ? [] : segments.filter((segment) => segment.itemId === context.itemId);
         const ancestors = new Set(context.ancestorIds || []);
         cached.scopes.set(scopeKey, {
+          mixed: new Map(),
           current: indexModel(buildNgrams(current, options)),
           ancestors: indexModel(buildNgrams(segments.filter((segment) => ancestors.has(segment.itemId)), options)),
+          // Disjoint buckets prevent counting a current-item observation again as
+          // both ancestor and document evidence when interpolating probabilities.
+          other: context.itemId == null && !ancestors.size ? cached.global :
+            indexModel(buildNgrams(segments.filter((segment) => segment.itemId !== context.itemId &&
+              !ancestors.has(segment.itemId)), options)),
         });
       }
       return { ...cached.scopes.get(scopeKey), global: cached.global, observedTokens: cached.observedTokens };
+    }
+
+    function nextDistribution(history, models) {
+      const key = contextKey(history.slice(-4));
+      if (models.mixed.has(key)) return models.mixed.get(key);
+      const distributions = [models.current, models.ancestors, models.global, corpus].map((model) =>
+        model ? model.distribution(history) : { probabilities: new Map(), support: new Map(),
+          unigramSupport: new Map(), longest: 0, total: 0, unigramTotal: 0 });
+      let sources = distributions;
+      let weights = [0.5, 0.2, 0.2, 0.1];
+      if (hasCorpus || valid && artifact.trained) {
+        sources = [distributions[0], distributions[1], models.other.distribution(history), distributions[3]];
+        const support = (entry) => entry.longest ? entry.total : history.length ? 0 : entry.unigramTotal;
+        // Corpus probabilities form a prior of fixed strength. Matching evidence
+        // in this document gradually outweighs that prior; unrelated tokens do not.
+        weights = [4 * support(sources[0]), 2 * support(sources[1]), support(sources[2]), adaptation.corpusPrior];
+      }
+      const probabilities = new Map();
+      let mass = 0;
+      sources.forEach((entry, index) => {
+        if (!entry.probabilities.size || !weights[index]) return;
+        const sum = [...entry.probabilities.values()].reduce((a, b) => a + b, 0);
+        if (!(sum > 0)) return;
+        mass += weights[index];
+        for (const [token, probability] of entry.probabilities) {
+          probabilities.set(token, (probabilities.get(token) || 0) + weights[index] * probability / sum);
+        }
+      });
+      for (const [token, probability] of probabilities) probabilities.set(token, probability / (mass || 1));
+      const result = { probabilities, distributions };
+      if (models.mixed.size >= 2000) models.mixed.clear();
+      models.mixed.set(key, result);
+      return result;
+    }
+
+    function prepareCandidates(candidates, context = {}) {
+      if (!hasCorpus || !Array.isArray(candidates)) return candidates;
+      let cached = evidenceCache.get(context);
+      if (!cached) { cached = new Map(); evidenceCache.set(context, cached); }
+      const models = localModels(context);
+      const prefix = context.prefix || "";
+      return candidates.map((candidate) => {
+        const fullText = candidate?.fullText ?? candidate?.insertText;
+        if (typeof fullText !== "string") return candidate;
+        let evidence = cached.get(fullText);
+        if (!evidence) {
+          // Tokenize prefix+suffix together, including cursors inside a command.
+          const tokens = tokenize(prefix + fullText);
+          let history = tokens.filter((token) => token.end <= prefix.length).map((token) => token.value).slice(-4);
+          const suffix = tokens.filter((token) => token.end > prefix.length).slice(0, 32);
+          let logProbability = 0, documentEvidence = 0, sameItemEvidence = 0, ancestorEvidence = 0;
+          for (const { value } of suffix) {
+            const next = nextDistribution(history, models);
+            logProbability += Math.log(Math.max(next.probabilities.get(value) || 0, 1e-12));
+            const support = next.distributions.map((entry) => entry.longest ? entry.support.get(value) || 0 : 0);
+            sameItemEvidence += support[0];
+            ancestorEvidence += support[1];
+            documentEvidence += support[2];
+            history = [...history, value].slice(-4);
+          }
+          const count = Math.max(1, suffix.length);
+          evidence = { ngramLogProbability: logProbability / count,
+            documentEvidence: documentEvidence / count, sameItemEvidence: sameItemEvidence / count,
+            ancestorEvidence: ancestorEvidence / count };
+          cached.set(fullText, evidence);
+        }
+        // Keep candidate properties in raw units; featureValues applies logs once.
+        const features = { ...candidate.features };
+        for (const name of Object.keys(evidence)) delete features[name];
+        return { ...candidate, ...evidence, features };
+      });
+    }
+
+    function feedback(candidate, accepted) {
+      const snapshot = candidate?._feedback;
+      if (typeof accepted !== "boolean" || !snapshot || !feedbackSnapshots.has(snapshot)) return false;
+      feedbackSnapshots.delete(snapshot);
+      const residual = clamp(onlineBias + snapshot.features.reduce((sum, value, at) =>
+        sum + onlineWeights[at] * value, 0), -adaptation.feedbackLimit, adaptation.feedbackLimit);
+      const probability = 1 / (1 + Math.exp(-clamp(snapshot.baseLogit + residual, -40, 40)));
+      const error = Number(accepted) - probability;
+      const norm = 1 + snapshot.features.reduce((sum, value) => sum + value * value, 0);
+      onlineBias = clamp(adaptation.feedbackDecay * onlineBias + adaptation.feedbackRate * error,
+        -adaptation.feedbackLimit, adaptation.feedbackLimit);
+      onlineWeights = onlineWeights.map((weight, at) => clamp(adaptation.feedbackDecay * weight +
+        adaptation.feedbackRate * error * snapshot.features[at] / norm, -adaptation.feedbackLimit, adaptation.feedbackLimit));
+      updates++;
+      return true;
+    }
+
+    function calibrationState() {
+      return { updates, bias: onlineBias, weightNorm: Math.hypot(...onlineWeights) };
     }
 
     function rank(candidates, context = {}) {
       if (!Array.isArray(candidates)) return [];
       const observedContext = classifiedContext({ ...context, observedTokens: context.observedTokens || knownTokens(context) });
       const model = valid && artifact.trained ? artifact.ranker : null;
-      return candidates.filter((candidate) => candidate && typeof candidate.insertText === "string").map((candidate) => {
+      return prepareCandidates(candidates, context).filter((candidate) => candidate && typeof candidate.insertText === "string").map((candidate) => {
         const values = featureValues(candidate, observedContext);
         let raw = model ? model.bias : -0.5;
         for (let index = 0; index < values.length; index++) {
           raw += model ? model.weights[index] * (values[index] - model.means[index]) / model.scales[index] :
             BASELINE_WEIGHTS[index] * values[index];
         }
-        const score = 1 / (1 + Math.exp(-clamp(raw, -40, 40)));
+        const normalized = values.map((value, at) => clamp(model ? (value - model.means[at]) / model.scales[at] : value, -3, 3));
+        const snapshot = Object.freeze({ features: Object.freeze(normalized), baseLogit: raw });
+        feedbackSnapshots.add(snapshot);
+        const residual = clamp(onlineBias + normalized.reduce((sum, value, at) => sum + onlineWeights[at] * value, 0),
+          -adaptation.feedbackLimit, adaptation.feedbackLimit);
+        const score = 1 / (1 + Math.exp(-clamp(raw + residual, -40, 40)));
         const tier = tierFor(candidate, context);
         return { ...candidate, features: { ...candidate.features,
           ...Object.fromEntries(FEATURE_NAMES.map((name, index) => [name, values[index]])),
           sameItem: tier === 2 ? 1 : 0, parentItem: tier === 1 ? 1 : 0 },
-          scopeTier: tier, itemTier: tier, score };
+          scopeTier: tier, itemTier: tier, score, _feedback: snapshot };
       }).sort((a, b) => b.scopeTier - a.scopeTier || b.score - a.score ||
         b.insertText.length - a.insertText.length || a.insertText.localeCompare(b.insertText));
     }
@@ -438,9 +559,10 @@
       const beamWidth = Math.min(4, maxCandidates * 2);
 
       function nextOptions(beam) {
-        const distributions = [models.current, models.ancestors, models.global, corpus].map((model) => model.distribution(beam.history));
+        const mixed = nextDistribution(beam.history, models);
+        const { distributions } = mixed;
         if (!distributions.some((entry) => entry.longest > 0) && !(beam.partial && beam.history.length === 0)) return [];
-        const tokens = new Set(distributions.flatMap((entry) => [...entry.probabilities.keys()]));
+        const tokens = mixed.probabilities.keys();
         const options = [];
         const historyText = prefix + beam.suffix;
         let totalProbability = 0;
@@ -452,15 +574,7 @@
           const support = distributions.map((entry) => entry.longest ? entry.support.get(token) || 0 :
             beam.partial && beam.history.length === 0 ? entry.unigramSupport.get(token) || 0 : 0);
           const level = support[0] ? 2 : support[1] ? 1 : 0;
-          const weights = [0.5, 0.2, 0.2, 0.1];
-          let mass = 0, probability = 0;
-          for (let i = 0; i < distributions.length; i++) {
-            if (distributions[i].probabilities.size) {
-              mass += weights[i];
-              probability += weights[i] * (distributions[i].probabilities.get(token) || 0);
-            }
-          }
-          probability /= mass || 1;
+          let probability = mixed.probabilities.get(token) || 0;
           // A bounded soft preference guides the beam without forbidding mixed
           // operations such as intersections of groups or sets of scalars.
           if (Classifier?.tokenWeight && token !== END_TOKEN && token !== " ") {
@@ -532,14 +646,16 @@
       return rank([...found.values()], validationContext).slice(0, maxCandidates);
     }
 
-    return { valid, trained: valid && artifact.trained, candidates, rank,
-      reset() { localCache = new WeakMap(); recentSignature = undefined; recentModels = undefined; } };
+    return { valid, trained: valid && artifact.trained, candidates, rank, prepareCandidates, feedback, calibrationState,
+      reset() {
+        localCache = new WeakMap(); evidenceCache = new WeakMap(); recentSignature = undefined; recentModels = undefined;
+        feedbackSnapshots = new WeakSet(); updates = 0; onlineBias = 0; onlineWeights = FEATURE_NAMES.map(() => 0);
+      } };
   }
 
   return {
-    TOKENIZER_VERSION, tokenizerVersion: TOKENIZER_VERSION, SCHEMA_VERSION, CLASSIFIER_VERSION, END_TOKEN,
+    TOKENIZER_VERSION, tokenizerVersion: TOKENIZER_VERSION, SCHEMA_VERSION, CLASSIFIER_VERSION, END_TOKEN, DEFAULT_ADAPTATION,
     FEATURE_NAMES, featureNames: FEATURE_NAMES, tokenize, buildNgrams,
     validateArtifact, createUntrainedArtifact, validateCandidate, featureValues, createPredictor,
   };
 });
-

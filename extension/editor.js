@@ -234,7 +234,9 @@
         if (event.defaultPrevented || event.isComposing || this.composing ||
             event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
         if (event.key === "Escape") {
-          const hadSuggestion = Boolean(this.current()?.insertText);
+          const value = this.current();
+          const hadSuggestion = Boolean(value?.insertText && this.view.dom.querySelector(".ol-math-ghost"));
+          if (hadSuggestion) this.engine.feedback(value, false);
           this.dismiss();
           if (hadSuggestion) { event.preventDefault(); event.stopImmediatePropagation(); }
           return;
@@ -257,11 +259,18 @@
           userEvent: "input.complete.math",
           scrollIntoView: true,
         });
+        // A transaction filter can reject an insertion. Learn only when the
+        // visible completion was actually accepted into this document.
+        if (view.state.doc.length === value.doc.length + value.insertText.length &&
+            view.state.doc.sliceString(value.pos, value.pos + value.insertText.length) === value.insertText) {
+          this.engine.feedback(value, true);
+        }
       }
 
       settingsChanged() {
         this.dismiss();
-        this.engine.reset();
+        // Preferences do not change the document's learned notation or feedback.
+        // Switching files replaces the Controller and therefore its engine.
       }
 
       destroy() {

@@ -380,3 +380,61 @@ test("unknown symbol types remain neutral instead of being inferred from letter 
     assert.equal(values[FEATURE_NAMES.indexOf(name)], 0, name);
   }
 });
+
+function corpusArtifact(text) {
+  return { ...trainedArtifact({ ngramLogProbability: 1 }),
+    ngrams: buildNgrams(Array(20).fill(text)), ranker: { ...trainedArtifact({ ngramLogProbability: 1 }).ranker, bias: 2 } };
+}
+
+test('trained corpus changes initial reuse scores and local observations gradually outweigh its prior', () => {
+  const predictor = createPredictor(corpusArtifact('x_i+y_i'));
+  const rows = [{ insertText: 'y_i', kind: 'expression' }, { insertText: 'z_i', kind: 'expression' }];
+  const rankAt = (count) => predictor.rank(rows, { prefix: 'x_i+', cursor: 10000,
+    segments: segments(Array(count).fill('x_i+z_i'), null) });
+  const cold = rankAt(0), sparse = rankAt(1), warm = rankAt(20);
+  assert.equal(cold[0].insertText, 'y_i');
+  assert.equal(sparse[0].insertText, 'y_i', 'One local observation does not erase the corpus prior');
+  assert.equal(warm[0].insertText, 'z_i');
+  assert.ok(sparse.find(c => c.insertText === 'z_i').score > cold.find(c => c.insertText === 'z_i').score);
+  const otherCorpus = createPredictor(corpusArtifact('x_i+z_i'));
+  assert.equal(otherCorpus.rank(rows, { prefix: 'x_i+', segments: [] })[0].insertText, 'z_i');
+  assert.ok(predictor.candidates({ prefix: 'x_i+', segments: [] }).some(c => c.insertText === 'y_i'));
+});
+
+test('unrelated local token volume cannot drown a matching corpus context', () => {
+  const predictor = createPredictor(corpusArtifact('x_i+y_i'));
+  const rows = [{ insertText: 'y_i', kind: 'expression' }, { insertText: 'z_i', kind: 'expression' }];
+  const context = { prefix: 'x_i+', segments: segments(Array(100).fill('a=b'), null) };
+  assert.equal(predictor.rank(rows, context)[0].insertText, 'y_i');
+});
+
+test('feedback adjusts the learned prior once per snapshot and stays bounded within a document', () => {
+  const predictor = createPredictor(corpusArtifact('x_i+y_i'));
+  const context = { prefix: 'x_i+', segments: [] };
+  const rows = [{ insertText: 'y_i', kind: 'expression' }];
+  const initial = predictor.rank(rows, context)[0];
+  assert.equal(predictor.feedback(initial, false), true);
+  assert.equal(predictor.feedback(initial, false), false, 'One displayed example must not train twice');
+  const dismissed = predictor.rank(rows, context)[0];
+  assert.ok(dismissed.score < initial.score);
+  assert.equal(predictor.feedback({ ...dismissed, insertText: '_i' }, true), true, 'Type-through retains the original feature snapshot');
+  assert.ok(predictor.rank(rows, context)[0].score > dismissed.score);
+  for (let i = 0; i < 150; i++) predictor.feedback(predictor.rank(rows, context)[0], false);
+  const final = predictor.rank(rows, context)[0];
+  assert.ok(Number.isFinite(final.score));
+  assert.ok(final.score >= 1 / (1 + Math.exp(-(initial._feedback.baseLogit - 2))) - 1e-12);
+  assert.equal(predictor.calibrationState().updates, 152);
+  predictor.reset();
+  assert.equal(predictor.feedback(final, true), false);
+  assert.equal(predictor.calibrationState().updates, 0);
+  assert.equal(predictor.rank(rows, context)[0].score, initial.score);
+});
+
+test('schema3 validates adaptation controls and rejects stale trained weights', () => {
+  const artifact = corpusArtifact('x_i+y_i');
+  assert.equal(validateArtifact(artifact), true);
+  assert.equal(validateArtifact({ ...artifact, schemaVersion: 2 }), false);
+  for (const [key, value] of [['corpusPrior', 0], ['feedbackRate', NaN], ['feedbackDecay', 2], ['feedbackLimit', Infinity]]) {
+    assert.equal(validateArtifact({ ...artifact, adaptation: { ...artifact.adaptation, [key]: value } }), false);
+  }
+});

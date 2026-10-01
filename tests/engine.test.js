@@ -2,7 +2,10 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createEngine, DEFAULT_SETTINGS } = require('../extension/engine.js');
+const { createEngine: createRuntimeEngine, DEFAULT_SETTINGS } = require('../extension/engine.js');
+const Predictor = require('../extension/predictor.js');
+// Deterministic rule fixtures should not change whenever the shipped corpus is retrained.
+const createEngine = (settings = {}) => createRuntimeEngine({ model: Predictor.createUntrainedArtifact(), ...settings });
 
 function suggest(marked, settings) {
   const cursor = marked.indexOf('|');
@@ -313,6 +316,32 @@ test('shared selection keeps item priority and applies confidence only to genera
   const otherItem = {...reuse,itemTier:0};
   assert.equal(selectCandidate([otherItem,generated],0.85), generated);
   assert.equal(selectCandidate([otherItem,generated],0.95), otherItem);
+});
+
+test('trained selection ranks all providers while retaining scope and below-threshold reuse', () => {
+  const { selectCandidate } = require('../extension/engine.js');
+  const reuse = { insertText: 'reuse', kind: 'expression', score: 0.2, itemTier: 2, legacyScore: 100 };
+  const generated = { insertText: 'generated', kind: 'prediction', score: 0.9, itemTier: 2 };
+  const alternative = { insertText: 'other reuse', kind: 'expression', score: 0.7, itemTier: 2, legacyScore: 0 };
+  assert.equal(selectCandidate([reuse, generated], 0.5, true), generated);
+  assert.equal(selectCandidate([reuse, alternative], 0.5, true), alternative);
+  assert.equal(selectCandidate([reuse, generated], 0.95, true), reuse);
+  assert.equal(selectCandidate([reuse, { ...generated, itemTier: 0 }], 0.5, true), reuse);
+  assert.equal(selectCandidate([reuse, generated], 0.5, false), reuse);
+});
+
+test('engine feedback uses displayed snapshots and clears calibration on model replacement', () => {
+  const engine = createEngine();
+  const text = '$x^2+y^2$ $x^2';
+  const first = engine.suggest(text, text.length);
+  assert.equal(engine.feedback(first, false), true);
+  assert.equal(engine.calibrationState().updates, 1);
+  const next = engine.suggest(text + ' ', text.length + 1);
+  assert.equal(engine.calibrationState().updates, 1, 'Ordinary edits keep the document calibration');
+  assert.ok(next);
+  engine.setModel(Predictor.createUntrainedArtifact());
+  assert.equal(engine.calibrationState().updates, 0);
+  assert.equal(engine.feedback(next, true), false);
 });
 
 test('underscores reuse indices for the same base while respecting scope and braces', () => {

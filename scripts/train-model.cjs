@@ -104,22 +104,26 @@ function shingles(tokens) {
   return result;
 }
 
-function loadCorpus(input, options = DEFAULTS) {
+function loadCorpus(input, options = DEFAULTS, onProgress = () => {}) {
   const directory = fs.realpathSync(path.resolve(input));
   if (!fs.statSync(directory).isDirectory()) throw new Error('--input must be a directory.');
   const documents = [];
   let emptyDocuments = 0;
   let duplicateDocuments = 0;
   const byMathHash = new Map();
-  for (const filename of texFiles(directory)) {
+  const files = texFiles(directory);
+  for (const [fileIndex, filename] of files.entries()) {
+    if (fileIndex % 100 === 0) onProgress('Reading document ' + (fileIndex + 1) + '/' + files.length + '...');
     if (fs.statSync(filename).size > options.maxDocumentBytes) {
       throw new Error('A TeX file exceeds --max-document-bytes: ' + path.relative(directory, filename));
     }
     const text = fs.readFileSync(filename, 'utf8').replace(/^\uFEFF/, '');
     const parsed = analyzeDocument(text);
-    const segments = mathSegments(parsed).filter((segment) => tokenKey(segment.text).length > 0);
-    if (!segments.length) { emptyDocuments++; continue; }
-    const normalized = segments.map((segment) => tokenKey(segment.text));
+    const extracted = mathSegments(parsed).map((segment) => ({ segment, tokens: tokenKey(segment.text) }))
+      .filter((entry) => entry.tokens.length > 0);
+    if (!extracted.length) { emptyDocuments++; continue; }
+    const segments = extracted.map((entry) => entry.segment);
+    const normalized = extracted.map((entry) => entry.tokens);
     const mathHash = sha(JSON.stringify(normalized));
     const relative = path.relative(directory, filename).split(path.sep).join('/');
     // One top-level directory represents one paper/project. Flat files are separate families.
@@ -130,7 +134,7 @@ function loadCorpus(input, options = DEFAULTS) {
       continue;
     }
     const document = { text, segments, sourceHash: sha(text), mathHash, families: new Set([family]),
-      tokens: normalized.flat(), relative };
+      relative };
     byMathHash.set(mathHash, document);
     documents.push(document);
   }
@@ -164,10 +168,40 @@ function orderedCoverage(shorter, longer) {
   return tails.length / shorter.length;
 }
 
-function splitCorpus(corpus, seed) {
+// Keep exact 64-bit SHA shingle identities in packed buffers rather than millions
+// of JS Map/Set entries. Histogram intersections are safe upper bounds, so the
+// prefilter cannot discard a pair that passes the original grouping rules.
+function packShingles(tokens) {
+  const values = tokens.length >= 20 ? [...shingles(tokens)].sort() : [];
+  const high = new Uint32Array(values.length), low = new Uint32Array(values.length);
+  const buckets = new Uint32Array(1024);
+  for (let i = 0; i < values.length; i++) {
+    high[i] = Number.parseInt(values[i].slice(0, 8), 16);
+    low[i] = Number.parseInt(values[i].slice(8), 16);
+    buckets[high[i] >>> 22]++;
+  }
+  return { high, low, buckets, size: values.length };
+}
+
+function shingleIntersection(left, right, required) {
+  let upper = 0;
+  for (let bucket = 0; bucket < left.buckets.length; bucket++) {
+    upper += Math.min(left.buckets[bucket], right.buckets[bucket]);
+  }
+  if (upper < required) return 0;
+  let a = 0, b = 0, common = 0;
+  while (a < left.size && b < right.size) {
+    if (common + Math.min(left.size - a, right.size - b) < required) return 0;
+    if (left.high[a] === right.high[b] && left.low[a] === right.low[b]) { common++; a++; b++; }
+    else if (left.high[a] < right.high[b] || left.high[a] === right.high[b] && left.low[a] < right.low[b]) a++;
+    else b++;
+  }
+  return common;
+}
+
+function splitCorpus(corpus, seed, onProgress = () => {}) {
   const documents = corpus.documents.slice().sort((a, b) => lexical(a.mathHash, b.mathHash));
-  const segmentKeys = documents.map((document) => document.segments.map((segment) => tokenKey(segment.text))
-    .filter((tokens) => tokens.length >= GROUPING.minimumSegmentTokens).map((tokens) => sha(JSON.stringify(tokens))));
+  const segmentKeys = [];
   const parent = documents.map((_, index) => index);
   const find = (index) => {
     while (index !== parent[index]) { parent[index] = parent[parent[index]]; index = parent[index]; }
@@ -175,38 +209,54 @@ function splitCorpus(corpus, seed) {
   };
   const unite = (a, b) => { parent[find(b)] = find(a); };
   const families = new Map();
-  const postings = new Map();
+  const segmentPostings = new Map();
   const documentShingles = [];
   documents.forEach((document, index) => {
+    if (index % 100 === 0) onProgress('Grouping document ' + (index + 1) + '/' + documents.length + '...');
     for (const family of document.families) {
       if (families.has(family)) unite(index, families.get(family));
       else families.set(family, index);
     }
-    // Compare literal token shingles: variable names are retained, not generalized away.
-    const current = document.tokens.length >= 20 ? shingles(document.tokens) : new Set();
-    const intersections = new Map();
-    for (const shingle of current) {
-      for (const previous of postings.get(shingle) || []) intersections.set(previous, (intersections.get(previous) || 0) + 1);
+    const normalized = document.segments.map((segment) => tokenKey(segment.text));
+    const keys = normalized.filter((tokens) => tokens.length >= GROUPING.minimumSegmentTokens)
+      .map((tokens) => sha(JSON.stringify(tokens)));
+    segmentKeys.push(keys);
+    const counts = new Map();
+    for (const key of keys) counts.set(key, (counts.get(key) || 0) + 1);
+    const sharedSegments = new Map();
+    for (const [key, count] of counts) {
+      for (const [previous, previousCount] of segmentPostings.get(key) || []) {
+        sharedSegments.set(previous, (sharedSegments.get(previous) || 0) + Math.min(count, previousCount));
+      }
     }
-    for (const [previous, common] of intersections) {
-      const previousSize = documentShingles[previous].size;
-      const union = current.size + previousSize - common;
-      const smaller = Math.min(current.size, previousSize);
-      // Excerpts and shorter revisions can have low Jaccard similarity despite
-      // nearly all their content appearing in a longer document. Require enough
-      // distinct shingles to avoid grouping files for a few common formulas.
-      const nearDuplicate = union > 0 && common / union >= GROUPING.jaccard;
-      const shortIndex = current.size <= previousSize ? index : previous;
+    const current = packShingles(normalized.flat());
+    for (let previous = 0; previous < index; previous++) {
+      if (find(index) === find(previous)) continue;
+      const before = documentShingles[previous];
+      const smaller = Math.min(current.size, before.size);
+      const larger = Math.max(current.size, before.size);
+      const shortIndex = current.size <= before.size ? index : previous;
       const longIndex = shortIndex === index ? previous : index;
-      const containedVersion = smaller >= GROUPING.minimumContainmentShingles &&
-        common / smaller >= GROUPING.containment &&
-        orderedCoverage(segmentKeys[shortIndex], segmentKeys[longIndex]) >= GROUPING.orderedSegmentCoverage;
+      const shortSegments = segmentKeys[shortIndex];
+      const mayBeNear = larger > 0 && smaller / larger >= GROUPING.jaccard;
+      const mayBeContained = smaller >= GROUPING.minimumContainmentShingles &&
+        shortSegments.length >= GROUPING.minimumContainedSegments &&
+        (sharedSegments.get(previous) || 0) / shortSegments.length >= GROUPING.orderedSegmentCoverage;
+      if (!mayBeNear && !mayBeContained) continue;
+      const required = Math.min(
+        mayBeNear ? Math.ceil(GROUPING.jaccard * (current.size + before.size) / (1 + GROUPING.jaccard)) : Infinity,
+        mayBeContained ? Math.ceil(GROUPING.containment * smaller) : Infinity);
+      const common = shingleIntersection(current, before, required);
+      const union = current.size + before.size - common;
+      const nearDuplicate = mayBeNear && union > 0 && common / union >= GROUPING.jaccard;
+      const containedVersion = mayBeContained && common / smaller >= GROUPING.containment &&
+        orderedCoverage(shortSegments, segmentKeys[longIndex]) >= GROUPING.orderedSegmentCoverage;
       if (nearDuplicate || containedVersion) unite(index, previous);
     }
     documentShingles.push(current);
-    for (const shingle of current) {
-      if (!postings.has(shingle)) postings.set(shingle, []);
-      postings.get(shingle).push(index);
+    for (const [key, count] of counts) {
+      if (!segmentPostings.has(key)) segmentPostings.set(key, []);
+      segmentPostings.get(key).push([index, count]);
     }
   });
   const grouped = new Map();
@@ -233,6 +283,56 @@ function splitCorpus(corpus, seed) {
   return { splits, groupCount: groups.length };
 }
 
+// Misra-Gries admits frequent contexts anywhere in the corpus. Its counters are
+// used only to choose a bounded shortlist; a second full pass exports exact
+// successor counts for that shortlist. Corpus order never locks out late data.
+function buildCorpusNgrams(segments, options, onProgress = () => {}) {
+  const capacity = options.maxContexts * 4;
+  const shortlist = new Map();
+  let decrement = 0;
+  function visit(callback, phase) {
+    let processed = 0;
+    for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex++) {
+      const tokens = Predictor.tokenize(segments[segmentIndex]).map((token) => token.value);
+      if (tokens.some((token) => !token.length || token.length > 128 || /[\u0000-\u0009\u000b-\u001f\u007f]/.test(token))) continue;
+      tokens.push('<eos>');
+      for (let position = 0; position < tokens.length; position++) {
+        for (let length = 0; length < options.order && length <= position; length++) {
+          callback(JSON.stringify(tokens.slice(position - length, position)), tokens[position]);
+        }
+      }
+      processed += tokens.length - 1;
+      if (segmentIndex % 20000 === 0) onProgress(phase + ': ' + processed.toLocaleString('en-US') + ' tokens...');
+    }
+  }
+  visit((key) => {
+    if (key === '[]') return;
+    if (shortlist.has(key)) shortlist.set(key, shortlist.get(key) + 1);
+    else if (shortlist.size < capacity) shortlist.set(key, decrement + 1);
+    else {
+      decrement++;
+      for (const [context, count] of shortlist) if (count <= decrement) shortlist.delete(context);
+    }
+  }, 'Selecting corpus contexts');
+  const counts = new Map([['[]', { total: 0, next: new Map() }]]);
+  for (const key of shortlist.keys()) counts.set(key, { total: 0, next: new Map() });
+  shortlist.clear();
+  visit((key, next) => {
+    const entry = counts.get(key);
+    if (!entry) return;
+    entry.total++;
+    entry.next.set(next, (entry.next.get(next) || 0) + 1);
+  }, 'Recounting corpus contexts');
+  const contexts = [...counts].filter(([key, entry]) => key === '[]' || entry.total >= options.minCount)
+    .sort(([keyA, a], [keyB, b]) => (keyA === '[]' ? -1 : keyB === '[]' ? 1 : b.total - a.total) || keyA.localeCompare(keyB))
+    .slice(0, options.maxContexts)
+    .map(([key, entry]) => ({ context: JSON.parse(key), total: entry.total,
+      next: [...entry.next].filter(([, count]) => key === '[]' || count >= options.minCount)
+        .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, options.maxSuccessors) }))
+    .filter((entry) => entry.next.length > 0);
+  return { order: options.order, smoothing: 3, contexts };
+}
+
 function samplePositions(document, maxSamples, random) {
   const positions = new Set();
   for (const segment of document.segments) {
@@ -244,7 +344,15 @@ function samplePositions(document, maxSamples, random) {
       else if (/^\d{2,}$/.test(token.value)) positions.add(segment.start + token.start + 1);
     }
   }
-  return shuffle([...positions].sort((a, b) => a - b), random).slice(0, maxSamples).sort((a, b) => a - b);
+  // Reserve a few cursors in the first formula to measure initial suggestions
+  // as well as completions after document evidence accumulates.
+  const all = [...positions].sort((a, b) => a - b);
+  const first = document.segments[0];
+  const initial = shuffle(all.filter((cursor) => cursor > first.start && cursor < first.end), random)
+    .slice(0, Math.max(1, Math.floor(maxSamples / 4)));
+  const selected = new Set(initial);
+  return initial.concat(shuffle(all.filter((cursor) => !selected.has(cursor)), random)
+    .slice(0, Math.max(0, maxSamples - initial.length))).sort((a, b) => a - b);
 }
 
 function candidateMatches(prefix, insertion, continuation) {
@@ -252,6 +360,10 @@ function candidateMatches(prefix, insertion, continuation) {
   // Compare token arrays, not concatenated strings: `\\sin x` is distinct from `\\sinx`.
   const candidateTokens = tokenKey(prefix + insertion);
   const targetTokens = tokenKey(prefix + continuation);
+  return tokenPrefixMatches(candidateTokens, targetTokens);
+}
+
+function tokenPrefixMatches(candidateTokens, targetTokens) {
   return candidateTokens.length <= targetTokens.length &&
     candidateTokens.every((token, index) => token === targetTokens[index]);
 }
@@ -259,15 +371,21 @@ function candidateMatches(prefix, insertion, continuation) {
 function generateExamples(documents, artifact, options, engine = createEngine({ model: artifact })) {
   const random = randomGenerator(options.seed ^ 0x9E3779B9);
   const examples = [];
+  const scoringPredictor = Predictor.createPredictor(artifact);
+  const sampledByStage = { cold: 0, warm: 0 };
   const sampledByCategory = Object.fromEntries(CATEGORIES.map((category) => [category, 0]));
   let sampledCursors = 0;
-  for (const document of documents) {
+  for (const [documentIndex, document] of documents.entries()) {
+    engine.reset?.();
+    if (documentIndex % 10 === 0) options.onProgress?.('Sampling document ' + (documentIndex + 1) + '/' + documents.length + ' (' + sampledCursors + ' cursors)...');
     for (const cursor of samplePositions(document, options.maxSamples, random)) {
       const segment = document.segments.find((entry) => entry.start < cursor && cursor < entry.end);
       if (!segment) continue;
       const continuation = segment.text.slice(cursor - segment.start);
       if (!tokenKey(continuation).length) continue;
       sampledCursors++;
+      const stage = segment === document.segments[0] ? 'cold' : 'warm';
+      sampledByStage[stage]++;
       // Simulated append: neither the answer nor any later text enters retrieval/local counts.
       const visible = document.text.slice(0, cursor);
       const collected = engine.collectCandidates(visible, visible.length);
@@ -275,22 +393,25 @@ function generateExamples(documents, artifact, options, engine = createEngine({ 
       sampledByCategory[category]++;
       if (!collected) continue;
       const rows = [];
-      for (const candidate of collected.candidates) {
+      const targetTokens = tokenKey(collected.context.prefix + continuation);
+      const ranked = engine.rankCandidates ? engine.rankCandidates(collected.candidates, collected.context) :
+        scoringPredictor.rank(collected.candidates, collected.context);
+      for (const candidate of ranked) {
         if (!tokenKey(candidate.insertText || '').length) continue;
         const features = Predictor.featureValues(candidate, collected.context);
         if (features.length !== Predictor.FEATURE_NAMES.length || features.some((value) => !Number.isFinite(value))) {
           throw new Error('Candidate feature schema or numeric value is invalid.');
         }
-        rows.push({ features, label: Number(candidateMatches(collected.context.prefix, candidate.insertText, continuation)), chars: candidate.insertText.length,
+        rows.push({ features, runtimeScore: candidate.score, label: Number(tokenPrefixMatches(tokenKey(collected.context.prefix + candidate.insertText), targetTokens)), chars: candidate.insertText.length,
           scopeTier: candidate.scopeTier ?? candidate.itemTier ?? 0,
           itemTier: candidate.itemTier ?? candidate.scopeTier ?? 0, insertText: candidate.insertText,
           kind: candidate.kind, reliable: Boolean(candidate.reliable),
           legacyScore: candidate.legacyScore ?? 0, semanticScore: candidate.semanticScore ?? 0 });
       }
-      if (rows.length) examples.push({ rows, category });
+      if (rows.length) examples.push({ rows, category, stage });
     }
   }
-  return { examples, sampledCursors, sampledByCategory };
+  return { examples, sampledCursors, sampledByCategory, sampledByStage };
 }
 
 const sigmoid = (value) => 1 / (1 + Math.exp(-Math.max(-40, Math.min(40, value))));
@@ -362,23 +483,27 @@ function evaluate(samples, ranker, threshold = 0) {
   }
   const overall = emptyMetrics(samples.sampledCursors);
   const byCategory = Object.fromEntries(CATEGORIES.map((category) => [category, emptyMetrics(totals[category] || 0)]));
+  const byStage = Object.fromEntries(['cold', 'warm'].map((stage) => [stage, emptyMetrics(samples.sampledByStage?.[stage] || 0)]));
   const bySource = { reliable: emptyMetrics(samples.sampledCursors), generated: emptyMetrics(samples.sampledCursors) };
   for (const example of samples.examples) {
     const category = byCategory[categoryName(example.category)];
-    const rows = example.rows.map((row) => ({ ...row, score: probability(row, ranker) }));
+    const rows = example.rows.map((row) => ({ ...row, score: ranker ? probability(row, ranker) : row.runtimeScore }));
     rows.sort((a, b) => (b.itemTier ?? b.scopeTier ?? 0) - (a.itemTier ?? a.scopeTier ?? 0) ||
       b.score - a.score || b.chars - a.chars || (a.insertText || '').localeCompare(b.insertText || ''));
     recordCandidates(overall, rows);
     recordCandidates(category, rows);
+    if (byStage[example.stage]) recordCandidates(byStage[example.stage], rows);
     for (const source of Object.keys(bySource)) recordCandidates(bySource[source], rows.filter((row) => sourceName(row) === source));
     // Share the exact deployed selection policy, including reliable-provider fallback
     // and winning-item priority. The learned gate applies to generated candidates.
-    const selected = Engine.selectCandidate(rows, threshold);
+    const selected = Engine.selectCandidate(rows, threshold, Boolean(ranker));
     recordSelection(overall, selected);
     recordSelection(category, selected);
+    if (byStage[example.stage]) recordSelection(byStage[example.stage], selected);
     if (selected) recordSelection(bySource[sourceName(selected)], selected);
   }
   return { ...finishMetrics(overall),
+    byStage: Object.fromEntries(Object.entries(byStage).map(([name, metrics]) => [name, finishMetrics(metrics)])),
     byCategory: Object.fromEntries(Object.entries(byCategory).map(([name, metrics]) => [name, finishMetrics(metrics)])),
     bySource: Object.fromEntries(Object.entries(bySource).map(([name, metrics]) => [name, finishMetrics(metrics)])) };
 }
@@ -421,31 +546,30 @@ function train(options, dependencies = {}) {
   const collectExamples = dependencies.generateExamples || generateExamples;
   const onProgress = dependencies.onProgress || (() => {});
   onProgress('Reading LaTeX documents...');
-  const corpus = loadCorpus(options.input, options);
+  const corpus = loadCorpus(options.input, options, onProgress);
   onProgress('Loaded ' + corpus.documents.length + ' mathematical documents; removed ' + corpus.duplicateDocuments + ' duplicates and skipped ' + corpus.emptyDocuments + ' files without mathematics.');
-  const grouped = splitCorpus(corpus, options.seed);
+  const grouped = splitCorpus(corpus, options.seed, onProgress);
   const preparation = summarize(corpus, grouped, options);
   onProgress('Split ' + grouped.groupCount + ' document families: ' + SPLITS.map((name) => name + '=' + grouped.splits[name].length).join(', ') + '.');
   if (options.prepare) { writeJson(options.output, preparation); return { preparation }; }
   const segments = grouped.splits.train.flatMap((document) => document.segments.map((segment) => segment.text));
   const trainingTokens = segments.reduce((sum, segment) => sum + Predictor.tokenize(segment).length, 0);
   onProgress('Building order-' + options.order + ' n-grams from ' + trainingTokens + ' tokens...');
-  const ngrams = Predictor.buildNgrams(segments, { order: options.order, smoothing: 3,
-    minCount: options.minCount, maxContexts: options.maxContexts, maxSuccessors: options.maxSuccessors,
-    maxTokens: trainingTokens });
+  const ngrams = buildCorpusNgrams(segments, options, onProgress);
+  const sampleSettings = { ...options, onProgress };
   const initial = Predictor.createUntrainedArtifact(ngrams);
   if (!Predictor.validateArtifact(initial)) throw new Error('Generated n-gram artifact failed runtime validation.');
   onProgress('Generating ranker examples from ' + grouped.splits.rank.length + ' documents...');
-  const rankSamples = collectExamples(grouped.splits.rank, initial, options);
+  const rankSamples = collectExamples(grouped.splits.rank, initial, sampleSettings);
   onProgress('Fitting ranker from ' + rankSamples.examples.length + ' sampled cursors...');
   const fitted = trainRanker(rankSamples.examples, options);
   // Candidate generation itself ranks/truncates its beam. Evaluate with the fitted
   // ranker already installed, exactly as the deployed extension generates its shortlist.
   const fittedArtifact = { ...initial, trained: true, ranker: fitted.ranker };
   onProgress('Collecting validation examples from ' + grouped.splits.validation.length + ' documents...');
-  const validation = collectExamples(grouped.splits.validation, fittedArtifact, options);
+  const validation = collectExamples(grouped.splits.validation, fittedArtifact, sampleSettings);
   onProgress('Collecting test examples from ' + grouped.splits.test.length + ' documents...');
-  const test = collectExamples(grouped.splits.test, fittedArtifact, options);
+  const test = collectExamples(grouped.splits.test, fittedArtifact, sampleSettings);
   if (!validation.examples.length || !test.examples.length) {
     throw new Error('Validation and test documents must produce candidates. Add representative mathematical documents or increase --max-samples.');
   }
@@ -456,14 +580,20 @@ function train(options, dependencies = {}) {
       maxContexts: options.maxContexts, maxSuccessors: options.maxSuccessors, maxSamples: options.maxSamples,
       epochs: options.epochs }, trainingTokens, rankerExamples: fitted.counts, recommendedThreshold: threshold } };
   if (!Predictor.validateArtifact(artifact)) throw new Error('Trained artifact failed runtime validation.');
-  const report = { format: 'autotex-training-report-v2', tokenizerVersion: Predictor.TOKENIZER_VERSION,
+  onProgress('Collecting untrained baseline on the same held-out test cursors...');
+  const baseline = collectExamples(grouped.splits.test, Predictor.createUntrainedArtifact(), sampleSettings);
+  const report = { format: 'autotex-training-report-v3', tokenizerVersion: Predictor.TOKENIZER_VERSION,
     schemaVersion: initial.schemaVersion, classifierVersion: initial.classifierVersion,
     corpus: preparation, trainingTokens, ngramContexts: ngrams.contexts.length,
     serializedModelBytes: Buffer.byteLength(JSON.stringify(artifact) + '\n', 'utf8'), ranker: fitted.counts,
     recommendedThreshold: threshold, thresholdSource: 'validation', validationThresholdCurve,
     validation: evaluate(validation, fitted.ranker, threshold),
     test: evaluate(test, fitted.ranker, threshold),
-    evaluation: 'Simulated append with token-normalized prefix matching; not a mathematical-correctness or real-user-acceptance measurement.' };
+    baseline: evaluate(baseline, null, 0),
+    corpusCounting: 'Bounded Misra-Gries context selection over the full training split followed by exact successor recounting.',
+    stages: { cold: 'Cursors in the first mathematical segment, before any prior formula is available.',
+      warm: 'Cursors in later mathematical segments, using only earlier visible document text.' },
+    evaluation: 'Simulated append with token-normalized prefix matching and no acceptance/rejection feedback; not a mathematical-correctness or real-user-acceptance measurement.' };
   onProgress('Writing model and held-out evaluation report...');
   writeJson(options.output, artifact);
   writeJson(options.output.replace(/\.json$/i, '.report.json'), report);
@@ -510,4 +640,4 @@ if (require.main === module) {
 }
 
 module.exports = { DEFAULTS, GROUPING, CATEGORIES, parseArguments, loadCorpus, splitCorpus, samplePositions,
-  generateExamples, trainRanker, probability, evaluate, thresholdCurve, tuneThreshold, train, tokenKey, candidateMatches };
+  buildCorpusNgrams, generateExamples, trainRanker, probability, evaluate, thresholdCurve, tuneThreshold, train, tokenKey, candidateMatches };
