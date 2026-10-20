@@ -14,6 +14,7 @@
     enabled: true,
     expressions: true,
     sequences: true,
+    autoFractions: true,
     minPrefix: 3,
     maxSuggestionLength: 400,
     sequenceEnd: 'n',
@@ -421,6 +422,147 @@
       b.legacyScore-a.legacyScore).slice(0, 12);
   }
 
+  function fractionEdit(parsed, cursor) {
+    const active = Context.contextAt(parsed, cursor);
+    if (!active) return null;
+    const text = parsed.source;
+    // A trailing backslash belongs to TeX's literal \/ command.
+    if (Context.escaped(text, cursor)) return null;
+    let from = cursor;
+    while (from > active.region.start && !/\s/.test(text[from - 1])) from--;
+
+    // Environment arguments configure the surrounding math and must remain
+    // outside a new fraction, including when spaces occur inside the header.
+    function environmentBody(name, position) {
+      let at = position;
+      const skipSpace = () => { while (at < cursor && /\s/.test(text[at])) at++; };
+      function group(open, close) {
+        if (text[at] !== open) return false;
+        const stack = [close];
+        for (at++; at < cursor; at++) {
+          if (Context.escaped(text, at)) continue;
+          const value = text[at];
+          if (value === '{') stack.push('}');
+          else if (open === '[' && value === '[' && stack[stack.length - 1] === ']') stack.push(']');
+          else if (value === stack[stack.length - 1]) stack.pop();
+          if (!stack.length) { at++; return true; }
+        }
+        return false;
+      }
+      const required = /^(?:array|subarray|alignat\*?|alignedat)$/.test(name);
+      const optional = /^(?:array|alignedat|aligned|gathered|[pbBvV]?matrix\*)$/.test(name);
+      if (!required && !optional) return position;
+      skipSpace();
+      if (optional && text[at] === '[') {
+        if (!group('[', ']')) return null;
+        skipSpace();
+      }
+      if (required && !group('{', '}')) return null;
+      return at;
+    }
+    if (active.region.environment) {
+      const start = environmentBody(active.region.environment, active.region.start);
+      if (start === null) return null;
+      from = Math.max(from, start);
+    }
+    const environments = /\\begin\s*\{([^{}]+)\}/g;
+    const mathPrefix = parsed.clean.slice(active.region.start, cursor);
+    let environment;
+    while ((environment = environments.exec(mathPrefix))) {
+      if (Context.escaped(text, active.region.start + environment.index)) continue;
+      const start = environmentBody(environment[1], active.region.start + environments.lastIndex);
+      if (start === null || start > cursor) return null;
+      from = Math.max(from, start);
+    }
+
+    // In "\\left (PQ", whitespace separates the delimiter from its command.
+    // Moving that delimiter into a fraction would make \\left consume \\frac.
+    const delimiterCommand = /\\(?:left|right|middle|[bB]ig(?:g)?[lrm]?)\s+$/.exec(text.slice(active.region.start, from));
+    if (delimiterCommand && !Context.escaped(text, active.region.start + delimiterCommand.index)) return null;
+    // In "\\sqrt PQ" or "\\frac{A} B", replacing an unbraced argument with
+    // a command would make TeX consume only the new \\frac token. Leave these
+    // spaced argument forms literal; conventional braced input remains usable.
+    const beforeBlock = parsed.clean.slice(active.region.start, from);
+    const argumentCommands = /\\([dtc]?frac|[dt]?binom|overset|underset|stackrel|sqrt|overline|underline|hat|bar|vec|dot|ddot|tilde|widehat|widetilde|math(?:bf|rm|it|sf|tt|cal|bb|frak))(?![A-Za-z])/g;
+    let argumentCommand;
+    while ((argumentCommand = argumentCommands.exec(beforeBlock))) {
+      if (Context.escaped(beforeBlock, argumentCommand.index)) continue;
+      let at = argumentCommands.lastIndex;
+      const skipSpace = () => { while (/\s/.test(beforeBlock[at] || '')) at++; };
+      const skipGroup = (open, close) => {
+        let depth = 0;
+        do {
+          if (!Context.escaped(beforeBlock, at)) {
+            if (beforeBlock[at] === open) depth++;
+            else if (beforeBlock[at] === close) depth--;
+          }
+          at++;
+        } while (at < beforeBlock.length && depth);
+        return depth === 0;
+      };
+      skipSpace();
+      if (argumentCommand[1] === 'sqrt' && beforeBlock[at] === '[') {
+        if (!skipGroup('[', ']')) continue;
+      }
+      const count = /^(?:[dtc]?frac|[dt]?binom|overset|underset|stackrel)$/.test(argumentCommand[1]) ? 2 : 1;
+      for (let index = 0; index < count; index++) {
+        skipSpace();
+        if (at === beforeBlock.length) return null;
+        if (beforeBlock[at] === '{') {
+          if (!skipGroup('{', '}')) break; // The cursor is inside an existing braced argument.
+        } else {
+          const token = /^\\(?:[A-Za-z]+|[^A-Za-z])/.exec(beforeBlock.slice(at));
+          at += token?.[0].length || 1;
+        }
+      }
+    }
+    const groups = [];
+    for (let at = from; at < cursor;) {
+      const character = text[at];
+      if (character === '\\') {
+        const command = /^\\(?:[A-Za-z]+|[^A-Za-z])/.exec(text.slice(at, cursor))?.[0];
+        if (!command) return null;
+        at += command.length;
+        if (command === '\\\\') {
+          // Alignment rows and cells are outside the numerator.
+          const spacing = /^\[[^\]]*\]/.exec(text.slice(at, cursor));
+          at += spacing?.[0].length || 0;
+          from = at;
+          groups.length = 0;
+        } else if (command === '\\begin' || command === '\\end') {
+          const environment = /^\{[^{}]+\}/.exec(text.slice(at, cursor));
+          if (!environment) return null;
+          at += environment[0].length;
+          from = at;
+          groups.length = 0;
+        } else if (command === '\\left' || command === '\\right' || command === '\\middle') {
+          const delimiter = /^(?:\\[A-Za-z]+|\\[^A-Za-z]|[()[\]{}|.<>])/.exec(text.slice(at, cursor));
+          if (!delimiter) return null;
+          at += delimiter[0].length;
+          if (command === '\\left') groups.push({ kind: 'delimiter', after: at });
+          else if (command === '\\right') { if (groups.pop()?.kind !== 'delimiter') return null; }
+          else {
+            const enclosing = groups[groups.length - 1];
+            if (enclosing?.kind !== 'delimiter') return null;
+            enclosing.middle = true;
+          }
+        }
+        continue;
+      }
+      if (character === '{') groups.push({ kind: 'brace', after: at + 1 });
+      else if (character === '}' && groups.pop()?.kind !== 'brace') return null;
+      else if (character === '&') { from = at + 1; groups.length = 0; }
+      at++;
+    }
+    // Inside an unfinished group, wrap only its content, keeping its opener and
+    // any existing closer in place. Never move an unmatched closer across braces.
+    if (groups.some((group) => group.middle)) return null;
+    if (groups.length) from = groups[groups.length - 1].after;
+    if (from === cursor) return null;
+    const insert = '\\frac{' + text.slice(from, cursor) + '}{}';
+    return { from, to: cursor, insert, anchor: from + insert.length - 1 };
+  }
+
   function createEngine(initialSettings) {
     let cachedText;
     let cachedParse;
@@ -510,6 +652,9 @@
       },
       isMathContext(documentText, cursor) {
         return typeof documentText === 'string' && Boolean(Context.contextAt(parse(documentText), cursor));
+      },
+      fractionEdit(documentText, cursor) {
+        return typeof documentText === 'string' ? fractionEdit(parse(documentText), cursor) : null;
       },
       setModel(nextArtifact) { artifact = nextArtifact; predictor = Predictor.createPredictor(artifact); return predictor.valid; },
       feedback(candidate, accepted) { return predictor.feedback(candidate, accepted); },

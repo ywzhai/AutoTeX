@@ -15,6 +15,7 @@ const DEFAULTS = {
   enabled: true,
   expressions: true,
   sequences: true,
+  autoFractions: true,
   minPrefix: 3,
   maxSuggestionLength: 400,
   sequenceEnd: "n",
@@ -113,6 +114,7 @@ test("bridge loads only its saved settings key and forwards a sanitized settings
     enabled: false,
     expressions: false,
     sequences: true,
+    autoFractions: false,
     minPrefix: 8,
     maxSuggestionLength: 900,
     sequenceEnd: " 010 ",
@@ -127,6 +129,7 @@ test("bridge loads only its saved settings key and forwards a sanitized settings
     enabled: false,
     expressions: false,
     sequences: true,
+    autoFractions: false,
     minPrefix: 8,
     maxSuggestionLength: 900,
     sequenceEnd: "10",
@@ -141,6 +144,7 @@ test("bridge rejects malformed saved preferences and uses safe defaults", () => 
     enabled: "false",
     expressions: 0,
     sequences: null,
+    autoFractions: "false",
     minPrefix: 0,
     maxSuggestionLength: 2001,
     sequenceEnd: "\\input{secret}",
@@ -304,4 +308,3 @@ test("only known statuses are accepted and disabled preferences override connect
   bridge.changeStorage({ [STORAGE_KEY]: { newValue: { enabled: true } } });
   assert.deepEqual(bridge.query().replies, [{ status: "connected" }]);
 });
-

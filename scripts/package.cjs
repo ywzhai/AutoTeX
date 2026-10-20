@@ -30,6 +30,9 @@ entries.push({ name: "INSTALL.txt", bytes: Buffer.from(
   "Type within LaTeX math to reuse document expressions, continue math patterns,\r\n" +
   "or extend a sequence such as x_1,x_2. Grey text previews the continuation.\r\n" +
   "Tab accepts. Esc dismisses. Undo removes acceptance.\r\n\r\n" +
+  "Type PQ/ in math to create \\frac{PQ}{} with the cursor in the denominator.\r\n" +
+  "The numerator stops at whitespace. Undo reverses the fraction expansion.\r\n" +
+  "Turn off Auto fractions in the popup to keep literal slashes.\r\n\r\n" +
   "The extension popup controls features and the default final index.\r\n" +
   "Suggestions run locally. Document text is never uploaded. No API key needed.\r\n" +
   "The included model.js identifies whether trained corpus data is installed.\r\n" +

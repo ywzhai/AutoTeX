@@ -1,6 +1,6 @@
 # AutoTeX
 
-A Chrome extension that offers grey inline LaTeX completions in Overleaf’s **Code Editor**. Press **Tab** to accept or **Esc** to dismiss. Suggestions activate only in mathematical regions and strongly prefer the current `\item` answer. Computation stays local; no account, API key, or server is needed.
+A Chrome extension that offers grey inline LaTeX completions and automatic fractions in Overleaf’s **Code Editor**. Press **Tab** to accept a suggestion or **Esc** to dismiss it. Type **/** after a math expression to turn it into a fraction. These features activate only in mathematical regions; suggestions strongly prefer the current `\item` answer. Computation stays local; no account, API key, or server is needed.
 
 AutoTeX combines a lightweight expression classifier, document retrieval, and a bounded 5-gram predictor. A trained corpus supplies initial token probabilities and ranking weights for every completion provider. As a document develops, matching local notation gains influence. Explicit **Tab** acceptance and **Esc** dismissal make small, bounded adjustments to the trained scores for that open document. The classifier itself uses syntax rules rather than a neural model.
 
@@ -10,13 +10,17 @@ AutoTeX combines a lightweight expression classifier, document retrieval, and a 
 2. Enable **Developer mode** in the upper-right corner.
 3. Click **Load unpacked** and select the `extension` folder in this project (the folder containing `manifest.json`). If using the release ZIP, extract it first and select the extracted folder containing `manifest.json`.
 4. Open or reload your Overleaf project, then choose **Code Editor**.
-5. Optionally pin **AutoTeX** from Chrome’s extensions menu. Its popup lets you pause suggestions, enable either feature, and choose a default final index.
+5. Optionally pin **AutoTeX** from Chrome’s extensions menu. Its popup lets you pause AutoTeX, toggle automatic fractions and each suggestion feature independently, and choose a default final index.
 
 The ready-to-load files are already in `extension/`. No build step or dependency installation is required to use the extension. Chrome 111 or newer is required.
 
 To update an existing installation, click **Reload** on the extension’s card at `chrome://extensions`, then reload the Overleaf project. Existing preferences are retained when loading the same folder.
 
 ## Try it
+
+Inside a math region, type `PQ/` to create `\frac{PQ}{}` with the cursor in the empty denominator. The numerator includes the uninterrupted text immediately before `/`, stopping at whitespace: `A + B+C/` becomes `A + \frac{B+C}{}`. Spaces, tabs, and line breaks separate numerator blocks. Math delimiters and surrounding LaTeX structure remain in place.
+
+Fractions expand immediately without a grey preview. A slash immediately after whitespace or at the start of math stays literal, as do pasted slashes. Standard Undo reverses the expansion independently of the text you typed before it. Turn off **Auto fractions** in the popup to keep typing literal slashes; the expression and sequence switches work independently.
 
 Write this somewhere in your open `.tex` file:
 
@@ -40,6 +44,7 @@ Suggestions first appear after a short typing pause. As you type matching charac
 
 ## What it recognizes
 
+- **Automatic fractions:** `/` wraps the contiguous math text immediately before the cursor in `\frac{...}{}` and places the cursor in the denominator. The **Auto fractions** switch controls this separately from suggestions.
 - **Repeated expressions:** matches the typed prefix against formulas and subexpressions elsewhere in the current file. It recognizes `$...$`, `$$...$$`, `\(...\)`, `\[...\]`, and common equation/alignment environments. At least three non-whitespace prefix characters are normally required.
 - **Predictive continuations:** uses short LaTeX token contexts and notation from the open file. Candidate generation has a four-path beam and a twelve-token limit. The same tokenizer and candidate providers are used for offline model training. The popup's **Suggest math expressions** switch controls both reuse and prediction.
 - **Corpus and document adaptation:** corpus probabilities support suggestions before a formula has appeared locally. Repeated matching patterns in the open file gradually outweigh that prior. The learned ranker scores reused formulas, sequences, indices, and predictions within the current-answer priority policy.
@@ -95,7 +100,7 @@ The browser suite uses real CodeMirror modules and reproduces Overleaf’s third
 
 The release ZIP is written to `dist/autotex.zip`. All runtime scripts are plain JavaScript; development libraries are never shipped. `tests/.generated/` and `test-results/` contain only local test output.
 
-The automated checks cover math-only gating, nested item priority, token boundaries, model validation, training leakage/determinism, expression and sequence matching, cursor/overlap edge cases, grey decorations, continuous typing with spaces and automatic brackets, acceptance, independent Undo, dismissal, document switching, settings, selection, read-only mode, and composition. Training tests use temporary artificial fixtures, which are not shipped as a trained model. A signed-in live Overleaf project has not been tested in this workspace.
+The automated checks cover automatic fractions and denominator placement, math-only gating, nested item priority, token boundaries, model validation, training leakage/determinism, expression and sequence matching, cursor/overlap edge cases, grey decorations, continuous typing with spaces and automatic brackets, acceptance, independent Undo, dismissal, document switching, settings, selection, read-only mode, and composition. Training tests use temporary artificial fixtures, which are not shipped as a trained model. A signed-in live Overleaf project has not been tested in this workspace.
 
 The benchmark measures complete engine calls on changed documents of several sizes, with the installed model. It excludes browser rendering and the default 50 ms scheduling delay, and is not a guarantee of end-to-end latency. Matching an existing ghost does not rerun prediction. Classifier work is bounded to 24,000 characters, 128 math rows, and 128 symbols; candidate work uses 128 nearby mathematical rows prioritized by item; parser updates currently reanalyze changed documents, so very large files still need profiling before distribution.
 

@@ -153,6 +153,99 @@ async function feedbackSessions(page) {
   })));
 }
 
+test("auto fractions wrap the typed block and support denominator typing and independent undo", async (t) => {
+  const page = await fixture(t);
+  await setDocument(page, "$|$");
+  await page.keyboard.type("PQ/");
+  assert.equal(await documentText(page), "$\\frac{PQ}{}$");
+  assert.equal(await page.evaluate(() => window.fixture.view.state.selection.main.head), "$\\frac{PQ}{".length);
+  await page.keyboard.type("R");
+  assert.equal(await documentText(page), "$\\frac{PQ}{R}$");
+  const undoKey = process.platform === "darwin" ? "Meta+z" : "Control+z";
+  await page.keyboard.press(undoKey);
+  assert.equal(await documentText(page), "$\\frac{PQ}{}$");
+  await page.keyboard.press(undoKey);
+  assert.equal(await documentText(page), "$PQ$");
+  assert.equal(await page.evaluate(() => window.fixture.view.state.selection.main.head), 3);
+  await noGhost(page);
+  await page.keyboard.press(process.platform === "darwin" ? "Meta+Shift+z" : "Control+Shift+z");
+  assert.equal(await documentText(page), "$\\frac{PQ}{}$");
+  assert.equal(await page.evaluate(() => window.fixture.view.state.selection.main.head), "$\\frac{PQ}{".length);
+  await setDocument(page, "$A + B+C|$");
+  await page.keyboard.press("/");
+  assert.equal(await documentText(page), "$A + \\frac{B+C}{}$");
+});
+
+test("auto fractions clear a visible suggestion without labeling it as model feedback", async (t) => {
+  const page = await fixture(t);
+  await observeFeedback(page);
+  await setDocument(page, "$a^2+b^2=c^2$\n$a^2|$");
+  await ghostText(page);
+  await page.keyboard.press("/");
+  assert.equal(await documentText(page), "$a^2+b^2=c^2$\n$\\frac{a^2}{}$");
+  await noGhost(page);
+  assert.deepEqual((await feedbackSessions(page))[0].events, []);
+});
+
+test("auto fractions have an independent live preference and respect the master switch", async (t) => {
+  const page = await fixture(t);
+  await page.evaluate(() => window.fixture.configure({ expressions: false, sequences: false }));
+  await setDocument(page, "$PQ|$");
+  await page.keyboard.press("/");
+  assert.equal(await documentText(page), "$\\frac{PQ}{}$");
+  await page.evaluate(() => window.fixture.configure({ autoFractions: false }));
+  await setDocument(page, "$PQ|$");
+  await page.keyboard.press("/");
+  assert.equal(await documentText(page), "$PQ/$");
+  await page.evaluate(() => window.fixture.configure({ autoFractions: true, enabled: false }));
+  await setDocument(page, "$PQ|$");
+  await page.keyboard.press("/");
+  assert.equal(await documentText(page), "$PQ/$");
+});
+
+test("auto fractions leave prose, text commands, empty numerators, and pasted slashes unchanged", async (t) => {
+  const page = await fixture(t);
+  for (const marked of ["PQ|", "$\\text{PQ|}$", "% $PQ|$", "$PQ |$", "$|$"]) {
+    const cursor = marked.indexOf("|");
+    const before = await setDocument(page, marked);
+    await page.keyboard.press("/");
+    assert.equal(await documentText(page), before.slice(0, cursor) + "/" + before.slice(cursor), marked);
+  }
+  await setDocument(page, "$PQ|$");
+  await page.locator('[aria-label="Source Editor editing"]').evaluate((element) => {
+    const clipboardData = new DataTransfer();
+    clipboardData.setData("text/plain", "/");
+    element.dispatchEvent(new ClipboardEvent("paste", { clipboardData, bubbles: true, cancelable: true }));
+  });
+  assert.equal(await documentText(page), "$PQ/$");
+});
+
+test("auto fractions respect selections, read-only editors, and composition", async (t) => {
+  const page = await fixture(t);
+  await setDocument(page, "$PQ|$", { readOnly: true });
+  await page.keyboard.press("/");
+  assert.equal(await documentText(page), "$PQ$");
+  await setDocument(page, "$PQ|$");
+  await page.keyboard.press("Shift+ArrowLeft");
+  await page.keyboard.press("/");
+  assert.equal(await documentText(page), "$P/$");
+  await setDocument(page, "$PQ|$");
+  await page.evaluate(() => {
+    const { view, CodeMirror } = window.fixture;
+    view.dispatch({ effects: CodeMirror.StateEffect.appendConfig.of(CodeMirror.EditorState.allowMultipleSelections.of(true)) });
+    view.dispatch({ selection: CodeMirror.EditorSelection.create([CodeMirror.EditorSelection.cursor(2), CodeMirror.EditorSelection.cursor(3)]) });
+  });
+  assert.equal(await page.evaluate(() => window.fixture.view.state.selection.ranges.length), 2);
+  await page.keyboard.press("/");
+  assert.equal(await documentText(page), "$P/Q/$");
+  await setDocument(page, "$PQ|$");
+  const editor = page.locator('[aria-label="Source Editor editing"]');
+  await editor.dispatchEvent("compositionstart", { data: "" });
+  await page.keyboard.press("/");
+  assert.ok(!(await documentText(page)).includes("\\frac"));
+  await editor.dispatchEvent("compositionend", { data: "" });
+});
+
 test("the installed model loads, offers a real completion, and learns from its acceptance", async (t) => {
   const page = await fixture(t, { bundledModel: true });
   assert.equal(await page.evaluate(() => window.AutoTexPredictor.validateArtifact(window.AutoTexModel)), true);
@@ -468,10 +561,13 @@ test("popup renders connection state and persists validated preferences", async 
   await page.waitForFunction(() => !document.getElementById("enabled").disabled);
   await page.waitForFunction(() => document.getElementById("connection-label").textContent === "Connected to your editor");
   assert.equal(await page.locator("#sequence-end").inputValue(), "n");
+  assert.equal(await page.locator("#autoFractions").isChecked(), true);
   await page.screenshot({ path: path.join(root, "test-results/popup.png"), fullPage: true });
 
   await page.locator("#expressions").uncheck();
   await page.waitForFunction(() => window.popupPreferences()?.expressions === false);
+  await page.locator("#autoFractions").uncheck();
+  await page.waitForFunction(() => window.popupPreferences()?.autoFractions === false);
   await page.locator("#sequences").uncheck();
   assert.equal(await page.locator("#sequence-end").isDisabled(), true);
   await page.locator("#sequences").check();
@@ -487,11 +583,12 @@ test("popup renders connection state and persists validated preferences", async 
   assert.equal(await page.locator("#sequence-error").isVisible(), false);
   await page.locator("#enabled").uncheck();
   await page.waitForFunction(() => window.popupPreferences()?.enabled === false);
-  assert.equal(await page.locator("#connection-label").textContent(), "Suggestions are paused");
+  assert.equal(await page.locator("#connection-label").textContent(), "AutoTeX is paused");
   await page.reload();
   await page.waitForFunction(() => !document.getElementById("enabled").disabled);
   assert.equal(await page.locator("#enabled").isChecked(), false);
   assert.equal(await page.locator("#expressions").isChecked(), false);
+  assert.equal(await page.locator("#autoFractions").isChecked(), false);
   assert.equal(await page.locator("#sequences").isChecked(), true);
   assert.equal(await page.locator("#sequence-end").inputValue(), "m");
 });

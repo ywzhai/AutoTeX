@@ -26,7 +26,7 @@
   function sourceIsEditable(view) {
     const selection = view.state.selection;
     const label = view.contentDOM.getAttribute("aria-label") || "";
-    return settings.enabled && (settings.expressions || settings.sequences) &&
+    return settings.enabled &&
       !view.state.readOnly && view.contentDOM.isContentEditable &&
       !/visual|rich text/i.test(label) && (!label || /source editor/i.test(label)) &&
       selection.ranges.length === 1 && selection.main.empty && view.hasFocus &&
@@ -170,7 +170,7 @@
         this.onBlur = () => this.dismiss();
         this.onCompositionStart = () => { this.composing = true; this.dismiss(); };
         this.onCompositionEnd = () => { this.composing = false; this.schedule(); };
-        // Capture only acceptance/dismissal of our own visible suggestion, before
+        // Capture acceptance/dismissal of our own visible suggestion, before
         // Overleaf's Tab indentation, snippets, and native completion keymaps.
         view.dom.addEventListener("keydown", this.onKey, true);
         view.contentDOM.addEventListener("blur", this.onBlur);
@@ -200,12 +200,12 @@
 
       schedule() {
         this.cancelTimer();
-        if (!this.alive || this.composing || !sourceIsEditable(this.view)) return;
+        if (!this.alive || this.composing || !(settings.expressions || settings.sequences) || !sourceIsEditable(this.view)) return;
         const document = this.view.state.doc;
         const position = this.view.state.selection.main.head;
         this.timer = setTimeout(() => {
           this.timer = null;
-          if (!this.alive || this.composing || !sourceIsEditable(this.view) ||
+          if (!this.alive || this.composing || !(settings.expressions || settings.sequences) || !sourceIsEditable(this.view) ||
               this.view.state.doc !== document || this.view.state.selection.main.head !== position) return;
           if (!isMathContext(document, position, this.engine)) return;
           const result = this.engine.suggest(document.toString(), position, settings);
@@ -230,6 +230,24 @@
         }
       }
 
+      insertFraction(from, to, text) {
+        const view = this.view;
+        if (text !== "/" || from !== to || from !== view.state.selection.main.head ||
+            !this.alive || this.composing || !settings.autoFractions || !sourceIsEditable(view)) return false;
+        const edit = this.engine.fractionEdit(view.state.doc.toString(), from);
+        if (!edit) return false;
+        this.cancelTimer();
+        view.dispatch({
+          changes: { from: edit.from, to: edit.to, insert: edit.insert },
+          selection: { anchor: edit.anchor },
+          effects: setSuggestion.of(null),
+          annotations: isolateHistory ? isolateHistory.of("full") : [],
+          userEvent: "input.complete.math.fraction",
+          scrollIntoView: true,
+        });
+        return true;
+      }
+
       keydown(event) {
         if (event.defaultPrevented || event.isComposing || this.composing ||
             event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
@@ -244,7 +262,7 @@
         if (event.key !== "Tab") return;
         const value = this.current();
         const view = this.view;
-        if (!value || !sourceIsEditable(view) || view.state.doc !== value.doc ||
+        if (!value || !(settings.expressions || settings.sequences) || !sourceIsEditable(view) || view.state.doc !== value.doc ||
             view.state.selection.main.head !== value.pos ||
             !isMathContext(view.state.doc, value.pos, this.engine) ||
             !view.dom.querySelector(".ol-math-ghost")) return;
@@ -286,7 +304,9 @@
       }
     }
 
-    return [suggestionField, ViewPlugin.fromClass(Controller)];
+    const controllerPlugin = ViewPlugin.fromClass(Controller);
+    return [suggestionField, controllerPlugin, EditorView.inputHandler.of((view, from, to, text) =>
+      view.plugin(controllerPlugin)?.insertFraction(from, to, text) || false)];
   }
 
   window.addEventListener("UNSTABLE_editor:extensions", (event) => {
@@ -308,7 +328,7 @@
     const input = event.data.settings;
     if (!input || typeof input !== "object") return;
     // Only settings are accepted across worlds. No message can insert text.
-    for (const key of ["enabled", "expressions", "sequences"]) {
+    for (const key of ["enabled", "expressions", "sequences", "autoFractions"]) {
       if (typeof input[key] === "boolean") settings[key] = input[key];
     }
     if (typeof input.sequenceEnd === "string" && /^(?:[A-Za-z]|[0-9]{1,3})$/.test(input.sequenceEnd)) {

@@ -6,12 +6,13 @@
     enabled: true,
     expressions: true,
     sequences: true,
+    autoFractions: true,
     minPrefix: 3,
     maxSuggestionLength: 400,
     sequenceEnd: "n",
     debounceMs: 50,
   };
-  const checkboxes = ["enabled", "expressions", "sequences"];
+  const checkboxes = ["enabled", "expressions", "sequences", "autoFractions"];
   const controls = Object.fromEntries(checkboxes.map((name) => [name, document.getElementById(name)]));
   const endInput = document.getElementById("sequence-end");
   const endError = document.getElementById("sequence-error");
@@ -39,7 +40,7 @@
       connected: "Connected to your editor",
       waiting: "Waiting for the code editor",
       unsupported: "Switch to Overleaf’s code editor",
-      disabled: "Suggestions are paused",
+      disabled: "AutoTeX is paused",
       unavailable: "Open or reload an Overleaf project",
     };
     connectionStatus.dataset.state = current;
