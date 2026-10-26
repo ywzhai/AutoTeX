@@ -501,6 +501,105 @@ test("product lists finish a partial second term and a partial synchronized endp
   await noGhost(page);
 });
 
+test("indexed chains preserve sum product and relation separators on acceptance", async (t) => {
+  const page = await fixture(t);
+  for (const [input, completion] of [
+    ["x_1+x_2", "+\\cdots+x_n"],
+    ["x_1\\cdot x_2", "\\cdot \\cdots\\cdot x_n"],
+    ["A_1 \\subseteq A_2", " \\subseteq \\cdots \\subseteq A_n"],
+    ["x_1 \\le x_2", " \\le \\cdots \\le x_n"],
+  ]) {
+    const before = await setDocument(page, "$" + input + "|$");
+    assert.equal(await ghostText(page), completion, input);
+    assert.equal(await documentText(page), before);
+    await page.keyboard.press("Tab");
+    assert.equal(await documentText(page), "$" + input + completion + "$", input);
+    await noGhost(page);
+  }
+});
+
+test("indexed chains advance synchronized sum factors and keep typed ellipses", async (t) => {
+  const page = await fixture(t);
+  await setDocument(page, "$a_1b_1+a_2b_2|$");
+  assert.equal(await ghostText(page), "+\\cdots+a_nb_n");
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), "$a_1b_1+a_2b_2+\\cdots+a_nb_n$");
+  await noGhost(page);
+  await setDocument(page, "$A_1 \\subseteq A_2 \\subseteq ...|$");
+  assert.equal(await ghostText(page), " \\subseteq A_n");
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), "$A_1 \\subseteq A_2 \\subseteq ... \\subseteq A_n$");
+  await noGhost(page);
+});
+
+test("nested indexed products preserve exponent structure and support independent Undo", async (t) => {
+  const page = await fixture(t, { bundledModel: true });
+  const before = await setDocument(page, "$a=p_1^{k_1}p_2^{k_2}...|$");
+  assert.equal(await ghostText(page), "p_n^{k_n}");
+  assert.equal(await documentText(page), before);
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), "$a=p_1^{k_1}p_2^{k_2}...p_n^{k_n}$");
+  await noGhost(page);
+  await page.keyboard.press(process.platform === "darwin" ? "Meta+z" : "Control+z");
+  assert.equal(await documentText(page), before);
+  await noGhost(page);
+  await setDocument(page, "$p_1^2p_2^2|$");
+  assert.equal(await ghostText(page), "\\cdots p_n^2");
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), "$p_1^2p_2^2\\cdots p_n^2$");
+  await noGhost(page);
+});
+
+test("nested indexed products finish partial terms and honor the configured final index", async (t) => {
+  const page = await fixture(t);
+  await setDocument(page, "$p_1^{k_1}p_2^{k_|}$");
+  assert.equal(await ghostText(page), "2}\\cdots p_n^{k_n");
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), "$p_1^{k_1}p_2^{k_2}\\cdots p_n^{k_n}$");
+  await noGhost(page);
+  await setDocument(page, "$p_1^{k_1}p_2^{k_2}...p_{m|}$");
+  assert.equal(await ghostText(page), "}^{k_m");
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), "$p_1^{k_1}p_2^{k_2}...p_{m}^{k_m}$");
+  await noGhost(page);
+  await page.evaluate(() => window.fixture.configure({ sequenceEnd: "m" }));
+  await setDocument(page, "$a=p_1^{k_1}p_2^{k_2}...|$");
+  assert.equal(await ghostText(page), "p_m^{k_m}");
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), "$a=p_1^{k_1}p_2^{k_2}...p_m^{k_m}$");
+  await noGhost(page);
+  await setDocument(page, "$p_1^{k_1}p_2^{k_2}...p_m^{k_|}$");
+  assert.equal(await ghostText(page), "m");
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), "$p_1^{k_1}p_2^{k_2}...p_m^{k_m}$");
+  await noGhost(page);
+});
+
+test("nested indexed products reuse a matching full-pattern document endpoint", async (t) => {
+  const page = await fixture(t);
+  const prior = "$p_1^{k_1}p_2^{k_2}\\cdots p_M^{k_M}$\n";
+  await setDocument(page, prior + "$a=p_1^{k_1}p_2^{k_2}...|$");
+  assert.equal(await ghostText(page), "p_M^{k_M}");
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), prior + "$a=p_1^{k_1}p_2^{k_2}...p_M^{k_M}$");
+  await noGhost(page);
+});
+
+test("indexed chains reject mixed separators and mismatched nested indices", async (t) => {
+  const page = await fixture(t);
+  await page.evaluate(() => window.fixture.configure({ expressions: false }));
+  for (const input of [
+    "$x_1+x_2,...|$",
+    "$A_1 \\subseteq A_2 \\supseteq ...|$",
+    "$p_1^{k_1}p_2^{k_3}...|$",
+    "$p_1^{k_1}p_2^{r_2}...|$",
+  ]) {
+    const before = await setDocument(page, input);
+    await noGhost(page);
+    assert.equal(await documentText(page), before, input);
+  }
+});
+
 test("switching to a new document clears suggestions and old expression sources", async (t) => {
   const page = await fixture(t);
   await setDocument(page, "$a^2 + b^2 = c^2$\n$a^2|$");

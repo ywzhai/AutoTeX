@@ -30,7 +30,6 @@
   // overlapping alternatives make failed matches exponential on long runs.
   const ELEMENT_PLAIN = String.raw`(?:\\(?!` + STYLE_NAMES + String.raw`)[A-Za-z]+(?![A-Za-z])|[A-Za-z0-9])`;
   const INDEXED_BASE_SOURCE = '(?:' + ELEMENT_STYLE + '|' + ELEMENT_GROUP + '|' + ELEMENT_PLAIN + ')+';
-  const TERM_SOURCE = '(' + INDEXED_BASE_SOURCE + ')' + String.raw`\s*_\s*(?:\{([^{}]+)\}|(\d+|[A-Za-z]|\\[A-Za-z]+))`;
   const compact = (value) => value.replace(/\s+/g, '');
   const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
@@ -38,11 +37,6 @@
 
   function baseStartsAt(text, position) {
     return !escaped(text, position) && !/[A-Za-z0-9\\}]/.test(text[position - 1] || '');
-  }
-
-  function termStartsAt(text, position) {
-    return baseStartsAt(text, position) &&
-      !/_\s*(?:\{[^{}]+\}|\\[A-Za-z]+|[A-Za-z]|\d+)[ \t]+$/.test(text.slice(0, position));
   }
 
   function trimOverlap(insertText, right) {
@@ -65,51 +59,181 @@
     return Object.assign({ insertText, fullText: original, kind, label }, details);
   }
 
-  function previousTerms(fragment) {
-    const expression = new RegExp(TERM_SOURCE, 'g');
-    const continuation = new RegExp(TERM_SOURCE, 'y');
+  // Parse scripted factors before finding sequence boundaries. In particular,
+  // the k_i inside p_i^{k_i} belongs to that factor, not to an outer list.
+  const SEQUENCE_OPERATORS = 'cdot|times|ast|star|circ|pm|mp|cup|cap|setminus|oplus|otimes|' +
+    'subset|subseteq|subsetneq|subsetneqq|subseteqq|supset|supseteq|supsetneq|supsetneqq|supseteqq|' +
+    'in|ni|le|leq|leqslant|ge|geq|geqslant|ll|gg|prec|preceq|succ|succeq|' +
+    'equiv|sim|simeq|approx|cong|to|rightarrow|leftarrow|leftrightarrow|mapsto|' +
+    'Rightarrow|Leftarrow|Leftrightarrow|implies|iff|mid|parallel|ne|neq';
+  const SEQUENCE_OPERATOR = '(?:\\\\(?:' + SEQUENCE_OPERATORS + ')(?![A-Za-z])|<=|>=|[,+*=<>;≤≥⊂⊆⊃⊇∪∩×·→←↔-])';
+  const SEQUENCE_BASE = '(?:' + ELEMENT_STYLE + '|' + ELEMENT_GROUP + '|' +
+    String.raw`(?:\\(?!(?:` + SEQUENCE_OPERATORS + String.raw`|ldots|cdots|dots)(?![A-Za-z]))(?!` +
+    STYLE_NAMES + String.raw`)[A-Za-z]+(?![A-Za-z])|[A-Za-z0-9]))+`;
+  const DOTS = /^(\\(?:l|c)?dots(?![A-Za-z])|\.{3}(?!\.)|…)/;
+  const endpointValue = (value) => /^(?:[A-Za-z]|\d+|\\[A-Za-z]+|[A-Za-z]\s*[-+]\s*\d+)$/.test(value);
+
+  function sequenceSeparator(raw) {
+    if (/^[ \t]*$/.test(raw)) return { key: '', raw };
+    const match = new RegExp('^\\s*(' + SEQUENCE_OPERATOR + ')\\s*$').exec(raw);
+    return match ? { key: match[1], raw } : null;
+  }
+
+  function separatorPrefix(text, separator) {
+    if (!separator.key) {
+      const raw = /^[ \t]*/.exec(text)[0];
+      return { raw, rest: text.slice(raw.length) };
+    }
+    const match = new RegExp('^\\s*' + escapeRegex(separator.key) +
+      (separator.key.startsWith('\\') ? '(?![A-Za-z])' : '') + '\\s*').exec(text);
+    return match ? { raw: match[0], rest: text.slice(match[0].length) } : null;
+  }
+
+  function ellipsisTail(tail, separator) {
+    const before = separatorPrefix(tail, separator);
+    const dots = before && DOTS.exec(before.rest);
+    if (!dots) return null;
+    const rest = before.rest.slice(dots[0].length);
+    const after = separatorPrefix(rest, separator);
+    if (!after && rest.trim()) return null;
+    return { dots: dots[0], typed: after?.rest || '', hasSeparator: !!after, after: after?.raw || '' };
+  }
+
+  function ellipsisBetween(raw) {
+    const match = /\\(?:l|c)?dots(?![A-Za-z])|\.{3}(?!\.)|…/.exec(raw);
+    if (!match) return null;
+    const before = sequenceSeparator(raw.slice(0, match.index));
+    const after = sequenceSeparator(raw.slice(match.index + match[0].length));
+    return before && after && before.key === after.key ? { ...before, dots: match[0] } : null;
+  }
+
+  function scriptArgument(text, position, limit = text.length) {
+    while (position < limit && /\s/.test(text[position])) position++;
+    const start = position;
+    if (text[position] === '{') {
+      let depth = 1;
+      for (position++; position < limit; position++) {
+        if (escaped(text, position)) continue;
+        if (text[position] === '{' && ++depth > 32) return null;
+        if (text[position] === '}' && --depth === 0) {
+          return { start, end: position + 1, from: start + 1, to: position, braced: true };
+        }
+      }
+      return null;
+    }
+    const match = /^(?:\\(?:[A-Za-z]+|[^\s])|\d+|[^{}_^\\\s])/.exec(text.slice(position, limit));
+    return match ? { start, end: position + match[0].length, from: start, to: position + match[0].length, braced: false } : null;
+  }
+
+  function scriptSlots(text, from, to, slots, depth = 0) {
+    if (depth > 32) return false;
+    for (let at = from; at < to; at++) {
+      if ((text[at] !== '_' && text[at] !== '^') || escaped(text, at)) continue;
+      const argument = scriptArgument(text, at + 1, to);
+      if (!argument) return false;
+      const value = text.slice(argument.from, argument.to).trim();
+      if (text[at] === '_' && endpointValue(value)) {
+        slots.push({ start: argument.start, end: argument.end, value, braced: argument.braced });
+      } else if (!scriptSlots(text, argument.from, argument.to, slots, depth + 1)) return false;
+      at = argument.end - 1;
+    }
+    return true;
+  }
+
+  function previousTerms(fragment, includeEndpoints = false, source = fragment) {
+    const base = new RegExp(SEQUENCE_BASE, 'y');
+    const atoms = [];
+    let at = 0;
+    while (at < fragment.length) {
+      base.lastIndex = at;
+      const match = base.exec(fragment);
+      if (!match || (at > 0 && !baseStartsAt(fragment, at) && atoms[atoms.length - 1]?.end !== at)) {
+        // Never start in the middle of a control word.
+        const command = /^\\[A-Za-z]+/.exec(fragment.slice(at));
+        at += command ? command[0].length : 1;
+        continue;
+      }
+      const start = at;
+      let end = base.lastIndex, hasScript = false, valid = true, incomplete = false;
+      const scripts = new Set();
+      while (true) {
+        let next = end;
+        while (/\s/.test(fragment[next] || '')) next++;
+        if (!/[_^]/.test(fragment[next] || '')) break;
+        hasScript = true;
+        if (scripts.has(fragment[next])) valid = false;
+        scripts.add(fragment[next]);
+        const argument = scriptArgument(fragment, next + 1);
+        if (!argument) { incomplete = true; break; }
+        end = argument.end;
+      }
+      if (incomplete) break;
+      if (!hasScript) { at = base.lastIndex; continue; }
+      const slots = [];
+      valid = scriptSlots(fragment, base.lastIndex, end, slots) && valid &&
+        fragment.slice(start, end) === source.slice(start, end);
+      const chunks = [];
+      let offset = start;
+      for (const slot of slots) {
+        chunks.push(fragment.slice(offset, slot.start), { value: slot.value, braced: slot.braced });
+        offset = slot.end;
+      }
+      chunks.push(fragment.slice(offset, end));
+      const value = slots[0]?.value;
+      const shared = valid && value && slots.every((slot) => compact(slot.value) === compact(value)) ? value : null;
+      atoms.push({ start, end, chunks, value: shared,
+        number: shared !== null && /^\d+$/.test(shared) && Number.isSafeInteger(Number(shared)) ? Number(shared) : null });
+      at = end;
+    }
     const terms = [];
-    let match;
-    while ((match = expression.exec(fragment))) {
-      if (!baseStartsAt(fragment, match.index)) continue;
-      const start = match.index, parts = [];
-      let end = start;
-      do {
-        const value = (match[2] || match[3]).trim();
-        parts.push({ base: match[1], number: /^\d+$/.test(value) ? Number(value) : null, braced: match[2] !== undefined,
-          gap: fragment.slice(end, match.index) });
-        end = match.index + match[0].length;
-        continuation.lastIndex = end;
-        while (/[ \t]/.test(fragment[continuation.lastIndex] || '')) continuation.lastIndex++;
-        match = continuation.exec(fragment);
-      } while (match);
-      expression.lastIndex = end;
-      // An endpoint after an ellipsis belongs to the completion tail, including
-      // when the user has already typed one or more of its index slots.
+    let endpointEnd = null;
+    for (const atom of atoms) {
+      if (endpointEnd !== null && /^[ \t]*$/.test(source.slice(endpointEnd, atom.start))) {
+        endpointEnd = atom.end;
+        continue;
+      }
+      endpointEnd = null;
       const previous = terms[terms.length - 1];
-      if (previous && /^\s*,\s*(?:\\(?:l|c)?dots|\.{3}|…)\s*,\s*$/.test(fragment.slice(previous.end, start))) continue;
-      const number = parts[0].number;
-      // Keep inconsistent products as a whole invalid term rather than letting
-      // their last factor become a different, apparently valid sequence.
-      terms.push({ parts, number: Number.isSafeInteger(number) && parts.every((part) => part.number === number) ? number : null,
-        start, end });
+      const gap = previous ? source.slice(previous.end, atom.start) : '';
+      if (!includeEndpoints && previous && ellipsisBetween(gap)) { endpointEnd = atom.end; continue; }
+      // Equal indices make a compound element; a changed index starts the next
+      // juxtaposed term. Invalid factors stay present so suffix runs cannot hide them.
+      if (previous && /^[ \t]*$/.test(gap) && atom.value !== null && compact(previous.value || '') === compact(atom.value)) {
+        previous.parts.push({ ...atom, gap });
+        previous.end = atom.end;
+      } else {
+        terms.push({ parts: [{ ...atom, gap: '' }], start: atom.start, end: atom.end, value: atom.value, number: atom.number });
+      }
     }
     return terms;
   }
 
   function sameParts(left, right) {
-    return left.length === right.length && left.every((part, index) => compact(part.base) === compact(right[index].base));
+    return left.length === right.length && left.every((part, index) => {
+      const chunks = right[index].chunks;
+      return part.chunks.length === chunks.length && part.chunks.every((chunk, i) =>
+        typeof chunk === 'string' ? typeof chunks[i] === 'string' && compact(chunk) === compact(chunks[i]) : typeof chunks[i] === 'object');
+    });
+  }
+
+  function latexJoin(left, right) {
+    return left + (/\\[A-Za-z]+$/.test(left) && /^[A-Za-z]/.test(right) ? ' ' : '') + right;
   }
 
   function completeTerm(parts, value, typed = '') {
     const needle = compact(typed), renderedParts = [];
     let text = '';
     for (const part of parts) {
-      const prefix = text + part.gap + part.base + '_';
-      const normalized = compact(prefix);
-      const braced = needle.startsWith(normalized) ? needle[normalized.length] === '{' : part.braced;
-      renderedParts.push({ ...part, braced });
-      text = prefix + indexText(value, braced);
+      text += part.gap;
+      const chunks = [];
+      for (const chunk of part.chunks) {
+        if (typeof chunk === 'string') { text = latexJoin(text, chunk); chunks.push(chunk); continue; }
+        const normalized = compact(text);
+        const braced = needle.startsWith(normalized) && needle.length > normalized.length ? needle[normalized.length] === '{' : chunk.braced;
+        chunks.push({ ...chunk, braced });
+        text += indexText(value, braced);
+      }
+      renderedParts.push({ ...part, chunks });
     }
     const normalized = compactWithPositions(text);
     if (!normalized.value.startsWith(needle)) return null;
@@ -117,85 +241,80 @@
     return { text, suffix: text.slice(offset), parts: renderedParts };
   }
 
-  function termPattern(parts, indexPattern) {
-    return parts.map((part, index) => (index ? '[ \\t]*' : '') +
-      escapeRegex(part.base).replace(/\s+/g, '\\s*') + String.raw`\s*_\s*` + indexPattern).join('');
-  }
-
-  function termEndsAt(text, position) {
-    if (/[A-Za-z0-9_]/.test(text[position] || '')) return false;
-    const continuation = new RegExp('[ \\t]*' + INDEXED_BASE_SOURCE + String.raw`\s*_`, 'y');
-    continuation.lastIndex = position;
-    return !continuation.test(text);
-  }
-
   function indexText(value, braced) {
     return braced || !/^(?:[A-Za-z]|\d)$/.test(value) ? '{' + value + '}' : value;
   }
 
-  function inferEndpoint(parsed, parts, firstNumber, cursor, settings) {
-    // Evidence from this answer takes priority even over a complete list in
-    // another answer. A nested subitem can fall back to its parent afterward.
+  function inferEndpoint(parsed, parts, firstNumber, cursor, settings, separator) {
+    // Evidence in the current answer wins before parent items and the rest of the file.
     if (!parsed.scopeFiltered && Context.itemAt(parsed, cursor)) {
       for (const tier of [2, 1, 0]) {
         const scoped = { ...parsed, scopeFiltered: true,
           regions: parsed.regions.filter((region) => Context.scopeTier(parsed, cursor, region.start) === tier) };
-        const result = inferEndpoint(scoped, parts, firstNumber, cursor, settings);
+        const result = inferEndpoint(scoped, parts, firstNumber, cursor, settings, separator);
         if (result.source === 'previous-list' || result.source === 'nearby-bound') return result;
       }
     }
-    const pattern = termPattern(parts, String.raw`(\{[^{}]+\}|[A-Za-z]|\d+|\\[A-Za-z]+)`);
-    const prior = new RegExp(pattern + String.raw`\s*,\s*` + pattern +
-      String.raw`\s*,\s*(\\(?:l|c)?dots|\.\.\.|…)\s*,\s*` + pattern, 'g');
-    const indexValue = (value) => value.replace(/^\{([\s\S]*)\}$/, '$1').trim();
-    const sharedValue = (values) => {
-      const normalized = values.map(indexValue);
-      return normalized.every((value) => compact(value) === compact(normalized[0])) ? normalized[0] : null;
-    };
+    const regions = parsed.regions.map((region) => {
+      const clean = parsed.clean.slice(region.start, region.end);
+      const body = parsed.source.slice(region.start, region.end);
+      const terms = region.sequenceTerms || (region.sequenceTerms = previousTerms(clean, true, body));
+      return { ...region, body, clean, terms };
+    });
     let best = null;
-    for (const region of parsed.regions) {
-      const body = parsed.clean.slice(region.start, region.end);
-      let match;
-      while ((match = prior.exec(body))) {
-        if (!termStartsAt(body, match.index) || !termEndsAt(body, prior.lastIndex)) continue;
-        const position = region.start + match.index;
-        if (position <= cursor && position + match[0].length >= cursor) continue;
-        const count = parts.length;
-        const firstValue = sharedValue(match.slice(1, count + 1));
-        const secondValue = sharedValue(match.slice(count + 1, count * 2 + 1));
-        const endpoint = sharedValue(match.slice(count * 2 + 2));
-        const first = Number(firstValue), second = Number(secondValue);
-        if (firstValue === null || secondValue === null || endpoint === null || !Number.isSafeInteger(first) ||
-            second !== first + 1 || !/^(?:[A-Za-z]|\d+|\\[A-Za-z]+|[A-Za-z]\s*[-+]\s*\d+)$/.test(endpoint)) continue;
-        const score = Math.abs(cursor - position) + (first === firstNumber ? 0 : 10000);
-        if (!best || score < best.score) best = { value: endpoint, dots: match[count * 2 + 1], score, source: 'previous-list', position };
+    for (const region of regions) {
+      for (let i = 0; i + 2 < region.terms.length; i++) {
+        const [first, second, last] = region.terms.slice(i, i + 3);
+        if (first.number === null || second.number !== first.number + 1 || !last.value || !endpointValue(last.value) ||
+            ![first, second, last].every((term) => sameParts(term.parts, parts))) continue;
+        const between = sequenceSeparator(region.body.slice(first.end, second.start));
+        const dots = ellipsisBetween(region.body.slice(second.end, last.start));
+        if (!between || between.key !== separator.key || !dots || dots.key !== separator.key) continue;
+        // Validate the entire numeric run before reusing its endpoint, including
+        // examples that spell out three or more terms before the ellipsis.
+        let runStart = i;
+        while (runStart > 0) {
+          const earlier = region.terms[runStart - 1], current = region.terms[runStart];
+          const before = sequenceSeparator(region.body.slice(earlier.end, current.start));
+          if (before?.key !== separator.key || earlier.number === null ||
+              earlier.number + 1 !== current.number || !sameParts(earlier.parts, parts)) break;
+          runStart--;
+        }
+        const earlier = region.terms[runStart - 1];
+        if (earlier) {
+          const before = sequenceSeparator(region.body.slice(earlier.end, region.terms[runStart].start));
+          if (before && (before.key === separator.key || before.key === '')) continue;
+        }
+        if (/[A-Za-z0-9_]/.test(region.body[last.end] || '')) continue;
+        const following = region.terms[i + 3];
+        if (following && sequenceSeparator(region.body.slice(last.end, following.start))?.key === '') continue;
+        const position = region.start + region.terms[runStart].start;
+        if (position <= cursor && region.start + last.end >= cursor) continue;
+        const score = Math.abs(cursor - position) + (region.terms[runStart].number === firstNumber ? 0 : 10000);
+        if (!best || score < best.score) best = { value: last.value, dots: dots.dots, score, source: 'previous-list', position };
       }
     }
     if (best) return best;
-
-    // A bound is evidence only if the same indexed variable appears in that math region.
-    const variable = new RegExp(termPattern(parts, String.raw`(\{[ijk]\}|[ijk])`), 'g');
-    for (const region of parsed.regions.slice().sort((a, b) => Math.abs(a.start - cursor) - Math.abs(b.start - cursor))) {
+    for (const region of regions.sort((a, b) => Math.abs(a.start - cursor) - Math.abs(b.start - cursor))) {
       if (Math.abs(region.start - cursor) > 1500) continue;
-      const body = parsed.clean.slice(region.start, region.end);
-      variable.lastIndex = 0;
-      const indexedVariables = Array.from(body.matchAll(variable)).filter((match) =>
-        termStartsAt(body, match.index) && termEndsAt(body, match.index + match[0].length));
-      for (const indexed of indexedVariables) {
-        const symbol = sharedValue(indexed.slice(1));
-        if (!symbol) continue;
+      for (let i = 0; i < region.terms.length; i++) {
+        const term = region.terms[i], before = region.terms[i - 1], after = region.terms[i + 1];
+        if ((before && sequenceSeparator(region.body.slice(before.end, term.start))?.key === '') ||
+            (after && sequenceSeparator(region.body.slice(term.end, after.start))?.key === '') ||
+            /[A-Za-z0-9_]/.test(region.body[term.end] || '')) continue;
+        if (!sameParts(term.parts, parts) || !/^[ijk]$/.test(term.value || '')) continue;
+        const symbol = term.value;
         const endpointPattern = String.raw`([A-Za-z](?:\s*[-+]\s*\d+)?|\d+|\\[A-Za-z]+)(?![A-Za-z0-9])`;
         const boundPatterns = [
           String.raw`(?:0|1)\s*\\le(?:q)?\s*` + symbol + String.raw`\s*\\le(?:q)?\s*`,
           symbol + String.raw`\s*=\s*(?:0|1)\s*,\s*(?:\\(?:l|c)?dots|\.\.\.)\s*,\s*`,
         ];
         for (const pattern of boundPatterns) {
-          for (const bound of body.matchAll(new RegExp(pattern + endpointPattern, 'g'))) {
-            if (!baseStartsAt(body, bound.index)) continue;
-            const remainder = body.slice(bound.index + bound[0].length).trimStart();
-            // Do not treat the first token of an unsupported expression as its endpoint.
+          for (const bound of region.clean.matchAll(new RegExp(pattern + endpointPattern, 'g'))) {
+            if (!baseStartsAt(region.clean, bound.index)) continue;
+            const remainder = region.clean.slice(bound.index + bound[0].length).trimStart();
             if (/^(?:[-+*\/^_(A-Za-z0-9]|\\(?:cdot|times|frac|over|div|ast)\b)/.test(remainder)) continue;
-            return { value: bound[1], dots: '\\ldots', source: 'nearby-bound', position: region.start };
+            return { value: bound[1], dots: separator.key === ',' ? '\\ldots' : '\\cdots', source: 'nearby-bound', position: region.start };
           }
         }
       }
@@ -205,73 +324,106 @@
     const explicitInteger = /^\d{1,3}$/.test(configured) && Number(configured) >= 3 && Number(configured) <= 999;
     const explicitSymbol = /^(?:[A-Za-z]|\\[A-Za-z]+|[A-Za-z]\s*[-+]\s*\d+)$/.test(configured);
     const value = explicitInteger ? String(Number(configured)) : explicitSymbol ? configured : 'n';
-    return { value, dots: '\\ldots', source: value === 'n' ? 'default' : 'configured' };
+    return { value, dots: separator.key === ',' ? '\\ldots' : '\\cdots', source: value === 'n' ? 'default' : 'configured' };
   }
 
   function sequenceSuggestion(parsed, region, text, cursor, settings) {
+    const outer = sequenceCompletion(parsed, region, text, cursor, settings);
+    if (outer) return outer;
+    // If no outer pattern fits, an unfinished script may itself contain a list
+    // (x^{a_1+a_2|}). Try only its currently open groups, never completed scripts.
+    const groups = [];
+    for (let at = region.start; at < cursor; at++) {
+      if (escaped(parsed.clean, at)) continue;
+      if (parsed.clean[at] === '{') groups.push(at);
+      else if (parsed.clean[at] === '}') groups.pop();
+    }
+    for (const start of groups.slice(-32).reverse()) {
+      const inner = sequenceCompletion(parsed, { ...region, start }, text, cursor, settings);
+      if (inner) return inner;
+    }
+    return null;
+  }
+
+  function sequenceCompletion(parsed, region, text, cursor, settings) {
     const fragmentStart = Math.max(region.start, cursor - 1000);
-    const fragment = parsed.clean.slice(fragmentStart, cursor);
-    const terms = previousTerms(fragment);
+    const fragment = text.slice(fragmentStart, cursor);
+    const terms = previousTerms(parsed.clean.slice(fragmentStart, cursor), false, fragment);
     if (!terms.length) return null;
     let last = terms[terms.length - 1];
+    // A partial factor or product is rendered from the previous complete term.
+    // This also covers an unfinished nested exponent p_2^{k_.
     const previous = terms[terms.length - 2];
-    // A partially typed product (a_2b_) initially contains only its first
-    // complete factor. Complete it from the preceding whole-product template.
-    if (previous && previous.number !== null && last.number === previous.number + 1 &&
-        last.parts.length < previous.parts.length && sameParts(last.parts, previous.parts.slice(0, last.parts.length)) &&
-        /^,\s*$/.test(fragment.slice(previous.end, last.start))) {
-      terms.pop();
-      last = previous;
+    if (previous && previous.number !== null) {
+      const separator = sequenceSeparator(fragment.slice(previous.end, last.start));
+      const typed = fragment.slice(last.start);
+      const next = separator && completeTerm(previous.parts, String(previous.number + 1), typed);
+      if (next && next.suffix && typed.includes('_')) { terms.pop(); last = previous; }
     }
     if (last.number === null) return null;
-    let tail = fragment.slice(last.end);
-    let partial = '';
-    let separator;
-    let trailingComma = false;
-    let runEnd = terms.length - 1;
-    let second = last;
-    const ellipsisTail = /^\s*,\s*(\\(?:l|c)?dots(?![A-Za-z])|\.{3}|…)([\s\S]*)$/.exec(tail);
-    const partialMatch = !ellipsisTail && /^(,\s*)([\s\S]+)$/.exec(tail);
-    const next = partialMatch && partialMatch[2].includes('_') && completeTerm(last.parts, String(last.number + 1), partialMatch[2]);
+    let tail = fragment.slice(last.end), partial = '', separator, second = last, runEnd = terms.length - 1;
+    // Find a partial next term after a supported operator (or juxtaposition).
+    const split = new RegExp('^(\\s*' + SEQUENCE_OPERATOR + '\\s*|[ \\t]*)([\\s\\S]+)$').exec(tail);
+    const next = split && split[2].includes('_') && completeTerm(last.parts, String(last.number + 1), split[2]);
     if (next) {
+      separator = sequenceSeparator(split[1]);
+      if (!separator) return null;
       partial = next.suffix;
-      separator = partialMatch[1];
       second = { ...last, number: last.number + 1, parts: next.parts, end: fragment.length };
+      tail = '';
     } else {
-      if (!ellipsisTail && !/^\s*,?\s*$/.test(tail)) return null;
-      trailingComma = tail.includes(',');
       const previous = terms[terms.length - 2];
-      if (!previous || previous.number === null || !sameParts(previous.parts, last.parts) || last.number !== previous.number + 1) return null;
-      separator = fragment.slice(previous.end, last.start);
-      if (!/^,\s*$/.test(separator)) return null;
+      if (!previous || previous.number === null || last.number !== previous.number + 1 || !sameParts(previous.parts, last.parts)) return null;
+      separator = sequenceSeparator(fragment.slice(previous.end, last.start));
+      if (!separator) return null;
       runEnd--;
     }
     let first = terms[runEnd];
     while (runEnd > 0) {
       const candidate = terms[runEnd - 1];
-      if (candidate.number === null || !sameParts(candidate.parts, first.parts) || candidate.number + 1 !== first.number ||
-          !/^,\s*$/.test(fragment.slice(candidate.end, first.start))) break;
+      const between = sequenceSeparator(fragment.slice(candidate.end, first.start));
+      if (candidate.number === null || !sameParts(candidate.parts, first.parts) || candidate.number + 1 !== first.number || between?.key !== separator.key) break;
       first = candidate;
       runEnd--;
     }
-    // A malformed earlier list must not be silently turned into a new consecutive run.
-    if (runEnd > 0 && /^,\s*$/.test(fragment.slice(terms[runEnd - 1].end, first.start))) return null;
-    const endpoint = inferEndpoint(parsed, second.parts, first.number, cursor, settings);
+    // An earlier mismatched term/operator invalidates the run rather than
+    // silently making its last two terms a fresh sequence. '=' may introduce it.
+    if (runEnd > 0) {
+      const earlier = sequenceSeparator(fragment.slice(terms[runEnd - 1].end, first.start));
+      if (earlier && (earlier.key === separator.key || earlier.key !== '=')) return null;
+    }
+    const dots = ellipsisTail(tail, separator);
+    const trailing = sequenceSeparator(tail);
+    if (!dots && (!trailing || (tail.trim() && trailing.key !== separator.key))) return null;
+    let endpoint = inferEndpoint(parsed, second.parts, first.number, cursor, settings, separator);
+    if (dots?.typed) {
+      // A value already supplied by the user is stronger evidence than a default
+      // (e.g. ...p_m^{k_| should finish k_m, even when the default is n).
+      const values = [];
+      for (let at = 0; at < dots.typed.length; at++) {
+        if (dots.typed[at] !== '_' || escaped(dots.typed, at)) continue;
+        const argument = scriptArgument(dots.typed, at + 1);
+        const partial = !argument && /^\s*\{([^{}]*)$/.exec(dots.typed.slice(at + 1));
+        const value = argument ? dots.typed.slice(argument.from, argument.to).trim() : partial?.[1].trim();
+        if (value && endpointValue(value)) values.push(value);
+      }
+      if (values.length && values.every((value) => compact(value) === compact(values[0])) &&
+          completeTerm(second.parts, values[0], dots.typed)) {
+        endpoint = { value: values[0], source: 'typed' };
+      }
+    }
     if (/^\d+$/.test(endpoint.value) && Number(endpoint.value) <= second.number) return null;
-    const afterDots = ellipsisTail && /^(\s*,\s*)([^\r\n]*)$/.exec(ellipsisTail[2]);
-    if (ellipsisTail && !afterDots && ellipsisTail[2].trim()) return null;
-    const typedEnd = afterDots?.[2] || '';
-    const ending = completeTerm(second.parts, endpoint.value, typedEnd);
+    const ending = completeTerm(second.parts, endpoint.value, dots?.typed || '');
     if (!ending) return null;
+    const missingSeparator = tail.trim()
+      ? /\s*$/.exec(separator.raw)[0].slice(/\s*$/.exec(tail)[0].length)
+      : separator.raw.replace(/^\s*/, (space) => space.slice(tail.length));
     let suffix;
-    if (ellipsisTail) {
-      // Preserve an ellipsis already typed by the user and fill only the missing
-      // comma/endpoint, including a partially typed base or subscript.
-      suffix = (afterDots ? '' : separator) + ending.suffix;
-    } else if (/^\d+$/.test(endpoint.value) && Number(endpoint.value) === second.number + 1) {
-      suffix = partial + (trailingComma ? separator.slice(tail.length) : separator) + ending.text;
+    if (dots) suffix = latexJoin(tail, (dots.hasSeparator ? '' : separator.raw) + ending.suffix).slice(tail.length);
+    else if (/^\d+$/.test(endpoint.value) && Number(endpoint.value) === second.number + 1) {
+      suffix = latexJoin(partial + missingSeparator, ending.text);
     } else {
-      suffix = partial + (trailingComma ? separator.slice(Math.min(tail.length, separator.length)) : separator) + endpoint.dots + separator + ending.text;
+      suffix = latexJoin(partial + missingSeparator + endpoint.dots + separator.raw, ending.text);
     }
     const beforeRun = fragment.slice(0, first.start).trimEnd();
     if (beforeRun.endsWith('\\left\\{')) suffix += '\\right\\}';

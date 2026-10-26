@@ -209,6 +209,158 @@ test('mixed elements and malformed list tails do not become indexed sequence com
   }
 });
 
+
+test('indexed sums, products, sets, and relation chains preserve their operators', () => {
+  for (const separator of ['+', ' + ', '-', '*', '\\cdot ', ' \\times ', '\\cup ', ' \\cap ',
+    '\\subset ', ' \\subseteq ', '\\supseteq ', '<', ' <= ', '\\le ', '\\geq ', '=', '\\sim ',
+    '\\to ', ' \\Rightarrow ', '⊆', '≤']) {
+    const input = '$ba_1' + separator + 'ba_2|$';
+    assert.equal(suffix(input), separator + '\\cdots' + separator + 'ba_n', input);
+  }
+  assert.equal(suffix('$a_1b_1+a_2b_2|$'), '+\\cdots+a_nb_n');
+  assert.equal(suffix('$a_{1}b_1 \\subseteq a_{2}b_2|$'), ' \\subseteq \\cdots \\subseteq a_{n}b_n');
+  assert.equal(suffix('$x_1+x_2|$', { sequenceEnd: '3' }), '+x_3');
+});
+
+test('chain continuations preserve trailing operator whitespace and already typed ellipses', () => {
+  for (const [input, expected] of [
+    ['$x_1 + x_2 +|$', ' \\cdots + x_n'],
+    ['$x_1 + x_2 + |$', '\\cdots + x_n'],
+    ['$x_1+x_2 |$', '+\\cdots+x_n'],
+    ['$x_1 + x_2 + ...|$', ' + x_n'],
+    ['$x_1+x_2+\\cdots+x_|$', 'n'],
+    ['$A_1 \\subseteq A_2 \\subseteq ... \\subseteq A_{|$', 'n}'],
+    ['$x_1 \\cdot x_2 \\cdot \\dots|$', ' \\cdot x_n'],
+    ['$a_1b_1+a_|$', '2b_2+\\cdots+a_nb_n'],
+    ['$a_1b_1+a_2b_|$', '2+\\cdots+a_nb_n'],
+    ['$a_1b_1+a_2b_2+...+a_nb_|$', 'n'],
+  ]) assert.equal(suffix(input), expected, input);
+});
+
+test('juxtaposed products distinguish compound terms from consecutive factors', () => {
+  for (const [input, expected] of [
+    ['$p_1p_2|$', '\\cdots p_n'],
+    ['$p_1 p_2|$', ' \\cdots p_n'],
+    ['$a_1b_1a_2b_2|$', '\\cdots a_nb_n'],
+    ['$a_1b_1 a_2b_2...|$', 'a_nb_n'],
+    ['$p_1p_2...|$', 'p_n'],
+    ['$p_1p_2\\cdots|$', ' p_n'],
+    ['$p_1p_2\\cdots |$', 'p_n'],
+    ['$p_1p_2...p_|$', 'n'],
+  ]) assert.equal(suffix(input), expected, input);
+  assert.equal(suffix('$p_1p_2|$', { sequenceEnd: '3' }), 'p_3');
+});
+
+test('nested script indices advance together and retain constants and script order', () => {
+  for (const [input, expected] of [
+    ['$a=p_1^{k_1}p_2^{k_2}|$', '\\cdots p_n^{k_n}'],
+    ['$a=p_1^{k_1}p_2^{k_2}...|$', 'p_n^{k_n}'],
+    ['$p_{1}^{k_{1}}+p_{2}^{k_{2}}|$', '+\\cdots+p_{n}^{k_{n}}'],
+    ['$p^{k_1}_1 \\times p^{k_2}_2|$', ' \\times \\cdots \\times p^{k_n}_n'],
+    ['$p_1^2p_2^2|$', '\\cdots p_n^2'],
+    ['$p_1^{2k_1+1}p_2^{2k_2+1}|$', '\\cdots p_n^{2k_n+1}'],
+    ['$a_{i_1},a_{i_2}|$', ',\\ldots,a_{i_n}'],
+    ['$p_1^{k_{j_1}}p_2^{k_{j_2}}|$', '\\cdots p_n^{k_{j_n}}'],
+  ]) assert.equal(suffix(input), expected, input);
+  assert.equal(suffix('$a=p_1^{k_1}p_2^{k_2}...|$', { sequenceEnd: 'm' }), 'p_m^{k_m}');
+  assert.equal(suffix('$p_1^{k_1}+p_2^{k_2}|$', { sequenceEnd: '10' }), '+\\cdots+p_{10}^{k_{10}}');
+});
+
+test('fixed one-token scripts are preserved and do not hide later sequences', () => {
+  assert.equal(suffix('$x_*=a_1+a_2|$'), '+\\cdots+a_n');
+  assert.equal(suffix('$x^*=a_1,a_2|$'), ',\\ldots,a_n');
+  assert.equal(suffix('$p_1^*p_2^*|$'), '\\cdots p_n^*');
+  assert.equal(suffix('$p_1^\\ast p_2^\\ast|$'), ' \\cdots p_n^\\ast');
+});
+
+test('nested sequence templates finish partially typed next terms and endpoints', () => {
+  for (const [input, expected] of [
+    ['$p_1^{k_1}p_|$', '2^{k_2}\\cdots p_n^{k_n}'],
+    ['$p_1^{k_1}p_2^{|$', 'k_2}\\cdots p_n^{k_n}'],
+    ['$p_1^{k_1}p_2^{k_|$', '2}\\cdots p_n^{k_n}'],
+    ['$p_1^{k_1}p_2^{k_2}...p_n^{k_|$', 'n}'],
+    ['$p_1^{k_1}p_2^{k_2}...p_{n}^{k_{|$', 'n}}'],
+    ['$p_1^{k_1}+p_2^{k_|}$', '2}+\\cdots+p_n^{k_n'],
+  ]) assert.equal(suffix(input), expected, input);
+});
+
+test('chain endpoint evidence matches the entire nested template and operator', () => {
+  for (const separator of ['+', '\\cdot ', ' \\subseteq ', '']) {
+    const prior = '$p_1^{k_1}' + separator + 'p_2^{k_2}' + separator + '\\cdots' + (separator || ' ') + 'p_m^{k_m}$\n';
+    const active = '$a=p_1^{k_1}' + separator + 'p_2^{k_2}|$';
+    const result = suggest(prior + active);
+    assert.equal(result?.endpointSource, 'previous-list', separator);
+    assert.equal(result.insertText, separator + '\\cdots' + (separator || ' ') + 'p_m^{k_m}', separator);
+  }
+  assert.equal(suffix('$p_i^{k_i},1\\le i\\le m$\n$a=p_1^{k_1}p_2^{k_2}...|$'), 'p_m^{k_m}');
+  const local = '\\begin{enumerate}\\item $p_1^{k_1}+p_2^{k_2}+\\cdots+p_N^{k_N}$' +
+    '\\item $p_i^{k_i},1\\le i\\le m$ $p_1^{k_1}+p_2^{k_2}+...|$\\end{enumerate}';
+  assert.equal(suffix(local), '+p_m^{k_m}');
+});
+
+test('unrelated operators, nested indices, and larger products cannot supply endpoint evidence', () => {
+  for (const evidence of [
+    'p_1^{k_1},p_2^{k_2},\\ldots,p_m^{k_m}',
+    'p_1^{r_1}+p_2^{r_2}+\\cdots+p_m^{r_m}',
+    'p_1^{k_1}+p_2^{k_2}+\\cdots+p_m^{k_j}',
+    'p_1^{k_1}+p_2^{k_2}+\\cdots+p_m^{k_m}q_m',
+    'p_1^{k_1}+p_2^{k_2}+\\cdots+p_{m+r}^{k_{m+r}}',
+    'p_i^{k_j},1\\le i\\le m', 'k_i,1\\le i\\le m',
+    'q_j p_i^{k_i},1\\le i\\le m', 'p_i^{k_i}q_j,1\\le i\\le m',
+  ]) assert.equal(suffix('$' + evidence + '$\n$p_1^{k_1}+p_2^{k_2}|$', { expressions: false }), '+\\cdots+p_n^{k_n}', evidence);
+});
+
+test('malformed chains and unsynchronized nested indices never become valid suffix runs', () => {
+  const engine = createEngine({ expressions: false });
+  for (const input of [
+    'x_1+x_3', 'x_1+x_2,...', 'x_1+x_2+...-', 'x_1+x_2\\cdots',
+    'x_1-x_2+x_3', 'A_1\\subset A_2\\supset A_3',
+    'x_1\\cdotfoo x_2', 'A_1\\subseteqfoo A_2',
+    'p_1^{k_2}p_2^{k_3}', 'p_1^{k_1}p_2^{k_3}', 'p_1^2p_2^3',
+    'p_1^{k_1}p_2^{k_2}...p_n^{k_m}', 'p_1^{k_j}p_2^{k_2}p_3^{k_3}',
+    'p_1^{k_1}+p_2^{r_2}', 'p_1^{k_1}+p_2^{k_2}+....',
+  ]) {
+    const text = '$' + input;
+    assert.equal(engine.suggest(text, text.length), null, input);
+  }
+});
+
+
+test('endpoint inference validates longer examples without discarding their valid prefix', () => {
+  for (const separator of [',', '+', '']) {
+    const prior = '$p_1^{k_1}' + separator + 'p_2^{k_2}' + separator + 'p_3^{k_3}' + separator + '\\cdots' +
+      (separator || ' ') + 'p_M^{k_M}$\n';
+    assert.equal(suffix(prior + '$p_1^{k_1}' + separator + 'p_2^{k_2}|$'),
+      separator + '\\cdots' + (separator || ' ') + 'p_M^{k_M}');
+  }
+  assert.equal(suffix('$x_0,x_2,x_3,\\ldots,x_M$\n$x_1,x_2|$', { expressions: false }), ',\\ldots,x_n');
+});
+
+test('excluded constants cannot disappear into a generated sequence template', () => {
+  const engine = createEngine({ expressions: false });
+  for (const command of ['\\text{foo}', '\\operatorname{rank}', '\\label{foo}']) {
+    const text = '$p_1^{' + command + 'k_1}p_2^{' + command + 'k_2}';
+    assert.equal(engine.suggest(text, text.length), null, text);
+    const evidence = '$p_i^{' + command + 'k_i},1\\le i\\le m$\n';
+    assert.equal(suffix(evidence + '$p_1^{k_1}p_2^{k_2}|$', { expressions: false }), '\\cdots p_n^{k_n}');
+  }
+  assert.equal(suffix('$x_1\\text{and}x_2|$', { expressions: false }), undefined);
+});
+
+test('an unfinished outer script can still contain its own indexed sequence', () => {
+  assert.equal(suffix('$x^{a_1+a_2|}$'), '+\\cdots+a_n');
+  assert.equal(suffix('$p_{a_1,a_2|}$'), ',\\ldots,a_n');
+  assert.equal(suffix('$x^{a_1+a_2|$'), '+\\cdots+a_n}');
+});
+
+test('partially typed endpoints supply the shared index for all remaining slots', () => {
+  assert.equal(suffix('$p_1^{k_1}p_2^{k_2}...p_{m|}$'), '}^{k_m');
+  assert.equal(suffix('$p_1^{k_1}p_2^{k_2}...p_m^{k_|$'), 'm}');
+  assert.equal(suffix('$p_1^{k_1}p_2^{k_2}...p_{m-1}^{k_{|$'), 'm-1}}');
+  assert.equal(suffix('$a_1b_1c_1+a_2b_2c_2+...+a_mb_mc_|$'), 'm');
+  assert.equal(suffix('$a_1b_1c_1+a_2b_2c_2+...+a_mb_nc_|$', { expressions: false }), undefined);
+});
+
 test('observed index reuse distinguishes compound elements from their last symbol', () => {
   const engine = createEngine();
   for (const [evidence, typed] of [['a_j', 'ba_'], ['cba_j', 'ba_'], ['ba_j', 'a_']]) {
