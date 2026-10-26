@@ -20,12 +20,30 @@
     sequenceEnd: 'n',
     debounceMs: 50
   });
-  const BASE_SOURCE = Classifier.SYMBOL_SOURCE;
-  const TERM_SOURCE = '(' + BASE_SOURCE + ')' + String.raw`\s*_\s*(?:\{(\d+)\}|(\d+))`;
+  // A list element may contain several adjacent symbols (ba, b\\alpha, etc.).
+  // Keep this separate from the classifier's individual mathematical symbols.
+  const ELEMENT_SYMBOL = String.raw`(?:\\[A-Za-z]+(?![A-Za-z])|[A-Za-z0-9])`;
+  const ELEMENT_GROUP = String.raw`\{\s*(?:` + ELEMENT_SYMBOL + String.raw`\s*)+\}`;
+  const STYLE_NAMES = '(?:mathbb|mathcal|mathfrak|mathrm|mathbf|mathit|mathsf|mathtt|boldsymbol|bm)(?![A-Za-z])';
+  const ELEMENT_STYLE = String.raw`\\` + STYLE_NAMES + String.raw`\s*(?:` + ELEMENT_GROUP + '|' + ELEMENT_SYMBOL + ')';
+  // Style commands must not also match a bare command followed by a group:
+  // overlapping alternatives make failed matches exponential on long runs.
+  const ELEMENT_PLAIN = String.raw`(?:\\(?!` + STYLE_NAMES + String.raw`)[A-Za-z]+(?![A-Za-z])|[A-Za-z0-9])`;
+  const INDEXED_BASE_SOURCE = '(?:' + ELEMENT_STYLE + '|' + ELEMENT_GROUP + '|' + ELEMENT_PLAIN + ')+';
+  const TERM_SOURCE = '(' + INDEXED_BASE_SOURCE + ')' + String.raw`\s*_\s*(?:\{([^{}]+)\}|(\d+|[A-Za-z]|\\[A-Za-z]+))`;
   const compact = (value) => value.replace(/\s+/g, '');
   const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
   const escaped = Context.escaped;
+
+  function baseStartsAt(text, position) {
+    return !escaped(text, position) && !/[A-Za-z0-9\\}]/.test(text[position - 1] || '');
+  }
+
+  function termStartsAt(text, position) {
+    return baseStartsAt(text, position) &&
+      !/_\s*(?:\{[^{}]+\}|\\[A-Za-z]+|[A-Za-z]|\d+)[ \t]+$/.test(text.slice(0, position));
+  }
 
   function trimOverlap(insertText, right) {
     const limit = Math.min(insertText.length, right.length);
@@ -49,75 +67,137 @@
 
   function previousTerms(fragment) {
     const expression = new RegExp(TERM_SOURCE, 'g');
+    const continuation = new RegExp(TERM_SOURCE, 'y');
     const terms = [];
     let match;
     while ((match = expression.exec(fragment))) {
-      const before = fragment[match.index - 1];
-      if (before && /[A-Za-z\\]/.test(before)) continue;
-      terms.push({
-        base: match[1], number: Number(match[2] || match[3]), braced: match[2] !== undefined,
-        start: match.index, end: expression.lastIndex
-      });
+      if (!baseStartsAt(fragment, match.index)) continue;
+      const start = match.index, parts = [];
+      let end = start;
+      do {
+        const value = (match[2] || match[3]).trim();
+        parts.push({ base: match[1], number: /^\d+$/.test(value) ? Number(value) : null, braced: match[2] !== undefined,
+          gap: fragment.slice(end, match.index) });
+        end = match.index + match[0].length;
+        continuation.lastIndex = end;
+        while (/[ \t]/.test(fragment[continuation.lastIndex] || '')) continuation.lastIndex++;
+        match = continuation.exec(fragment);
+      } while (match);
+      expression.lastIndex = end;
+      // An endpoint after an ellipsis belongs to the completion tail, including
+      // when the user has already typed one or more of its index slots.
+      const previous = terms[terms.length - 1];
+      if (previous && /^\s*,\s*(?:\\(?:l|c)?dots|\.{3}|…)\s*,\s*$/.test(fragment.slice(previous.end, start))) continue;
+      const number = parts[0].number;
+      // Keep inconsistent products as a whole invalid term rather than letting
+      // their last factor become a different, apparently valid sequence.
+      terms.push({ parts, number: Number.isSafeInteger(number) && parts.every((part) => part.number === number) ? number : null,
+        start, end });
     }
     return terms;
+  }
+
+  function sameParts(left, right) {
+    return left.length === right.length && left.every((part, index) => compact(part.base) === compact(right[index].base));
+  }
+
+  function completeTerm(parts, value, typed = '') {
+    const needle = compact(typed), renderedParts = [];
+    let text = '';
+    for (const part of parts) {
+      const prefix = text + part.gap + part.base + '_';
+      const normalized = compact(prefix);
+      const braced = needle.startsWith(normalized) ? needle[normalized.length] === '{' : part.braced;
+      renderedParts.push({ ...part, braced });
+      text = prefix + indexText(value, braced);
+    }
+    const normalized = compactWithPositions(text);
+    if (!normalized.value.startsWith(needle)) return null;
+    const offset = needle.length ? normalized.positions[needle.length - 1] + 1 : 0;
+    return { text, suffix: text.slice(offset), parts: renderedParts };
+  }
+
+  function termPattern(parts, indexPattern) {
+    return parts.map((part, index) => (index ? '[ \\t]*' : '') +
+      escapeRegex(part.base).replace(/\s+/g, '\\s*') + String.raw`\s*_\s*` + indexPattern).join('');
+  }
+
+  function termEndsAt(text, position) {
+    if (/[A-Za-z0-9_]/.test(text[position] || '')) return false;
+    const continuation = new RegExp('[ \\t]*' + INDEXED_BASE_SOURCE + String.raw`\s*_`, 'y');
+    continuation.lastIndex = position;
+    return !continuation.test(text);
   }
 
   function indexText(value, braced) {
     return braced || !/^(?:[A-Za-z]|\d)$/.test(value) ? '{' + value + '}' : value;
   }
 
-  function inferEndpoint(parsed, base, firstNumber, cursor, settings) {
+  function inferEndpoint(parsed, parts, firstNumber, cursor, settings) {
     // Evidence from this answer takes priority even over a complete list in
     // another answer. A nested subitem can fall back to its parent afterward.
     if (!parsed.scopeFiltered && Context.itemAt(parsed, cursor)) {
       for (const tier of [2, 1, 0]) {
         const scoped = { ...parsed, scopeFiltered: true,
           regions: parsed.regions.filter((region) => Context.scopeTier(parsed, cursor, region.start) === tier) };
-        const result = inferEndpoint(scoped, base, firstNumber, cursor, settings);
+        const result = inferEndpoint(scoped, parts, firstNumber, cursor, settings);
         if (result.source === 'previous-list' || result.source === 'nearby-bound') return result;
       }
     }
-    const literal = escapeRegex(base).replace(/\s+/g, '\\s*');
-    const index = String.raw`_\s*(?:\{([^{}]+)\}|([A-Za-z]|\d+|\\[A-Za-z]+))`;
-    const prior = new RegExp(literal + index + String.raw`\s*,\s*` + literal + index +
-      String.raw`\s*,\s*(\\(?:l|c)?dots|\.\.\.)\s*,\s*` + literal + index, 'g');
+    const pattern = termPattern(parts, String.raw`(\{[^{}]+\}|[A-Za-z]|\d+|\\[A-Za-z]+)`);
+    const prior = new RegExp(pattern + String.raw`\s*,\s*` + pattern +
+      String.raw`\s*,\s*(\\(?:l|c)?dots|\.\.\.|…)\s*,\s*` + pattern, 'g');
+    const indexValue = (value) => value.replace(/^\{([\s\S]*)\}$/, '$1').trim();
+    const sharedValue = (values) => {
+      const normalized = values.map(indexValue);
+      return normalized.every((value) => compact(value) === compact(normalized[0])) ? normalized[0] : null;
+    };
     let best = null;
     for (const region of parsed.regions) {
       const body = parsed.clean.slice(region.start, region.end);
       let match;
       while ((match = prior.exec(body))) {
+        if (!termStartsAt(body, match.index) || !termEndsAt(body, prior.lastIndex)) continue;
         const position = region.start + match.index;
         if (position <= cursor && position + match[0].length >= cursor) continue;
-        const first = Number(match[1] || match[2]);
-        const second = Number(match[3] || match[4]);
-        const endpoint = (match[6] || match[7]).trim();
-        if (!Number.isInteger(first) || second !== first + 1 || !/^(?:[A-Za-z]|\d+|\\[A-Za-z]+|[A-Za-z]\s*[-+]\s*\d+)$/.test(endpoint)) continue;
+        const count = parts.length;
+        const firstValue = sharedValue(match.slice(1, count + 1));
+        const secondValue = sharedValue(match.slice(count + 1, count * 2 + 1));
+        const endpoint = sharedValue(match.slice(count * 2 + 2));
+        const first = Number(firstValue), second = Number(secondValue);
+        if (firstValue === null || secondValue === null || endpoint === null || !Number.isSafeInteger(first) ||
+            second !== first + 1 || !/^(?:[A-Za-z]|\d+|\\[A-Za-z]+|[A-Za-z]\s*[-+]\s*\d+)$/.test(endpoint)) continue;
         const score = Math.abs(cursor - position) + (first === firstNumber ? 0 : 10000);
-        if (!best || score < best.score) best = { value: endpoint, dots: match[5], score, source: 'previous-list', position };
+        if (!best || score < best.score) best = { value: endpoint, dots: match[count * 2 + 1], score, source: 'previous-list', position };
       }
     }
     if (best) return best;
 
     // A bound is evidence only if the same indexed variable appears in that math region.
-    const variable = new RegExp(literal + String.raw`_\s*(?:\{([ijk])\}|([ijk]))`);
+    const variable = new RegExp(termPattern(parts, String.raw`(\{[ijk]\}|[ijk])`), 'g');
     for (const region of parsed.regions.slice().sort((a, b) => Math.abs(a.start - cursor) - Math.abs(b.start - cursor))) {
       if (Math.abs(region.start - cursor) > 1500) continue;
       const body = parsed.clean.slice(region.start, region.end);
-      const indexed = variable.exec(body);
-      if (!indexed) continue;
-      const symbol = indexed[1] || indexed[2];
-      const endpointPattern = String.raw`([A-Za-z](?:\s*[-+]\s*\d+)?|\d+|\\[A-Za-z]+)(?![A-Za-z0-9])`;
-      const boundPatterns = [
-        String.raw`(?:0|1)\s*\\le(?:q)?\s*` + symbol + String.raw`\s*\\le(?:q)?\s*`,
-        symbol + String.raw`\s*=\s*(?:0|1)\s*,\s*(?:\\(?:l|c)?dots|\.\.\.)\s*,\s*`,
-      ];
-      for (const pattern of boundPatterns) {
-        const bound = new RegExp(pattern + endpointPattern).exec(body);
-        if (!bound) continue;
-        const remainder = body.slice(bound.index + bound[0].length).trimStart();
-        // Do not treat the first token of an unsupported expression as its endpoint.
-        if (/^(?:[-+*\/^_(A-Za-z0-9]|\\(?:cdot|times|frac|over|div|ast)\b)/.test(remainder)) continue;
-        return { value: bound[1], dots: '\\ldots', source: 'nearby-bound', position: region.start };
+      variable.lastIndex = 0;
+      const indexedVariables = Array.from(body.matchAll(variable)).filter((match) =>
+        termStartsAt(body, match.index) && termEndsAt(body, match.index + match[0].length));
+      for (const indexed of indexedVariables) {
+        const symbol = sharedValue(indexed.slice(1));
+        if (!symbol) continue;
+        const endpointPattern = String.raw`([A-Za-z](?:\s*[-+]\s*\d+)?|\d+|\\[A-Za-z]+)(?![A-Za-z0-9])`;
+        const boundPatterns = [
+          String.raw`(?:0|1)\s*\\le(?:q)?\s*` + symbol + String.raw`\s*\\le(?:q)?\s*`,
+          symbol + String.raw`\s*=\s*(?:0|1)\s*,\s*(?:\\(?:l|c)?dots|\.\.\.)\s*,\s*`,
+        ];
+        for (const pattern of boundPatterns) {
+          for (const bound of body.matchAll(new RegExp(pattern + endpointPattern, 'g'))) {
+            if (!baseStartsAt(body, bound.index)) continue;
+            const remainder = body.slice(bound.index + bound[0].length).trimStart();
+            // Do not treat the first token of an unsupported expression as its endpoint.
+            if (/^(?:[-+*\/^_(A-Za-z0-9]|\\(?:cdot|times|frac|over|div|ast)\b)/.test(remainder)) continue;
+            return { value: bound[1], dots: '\\ldots', source: 'nearby-bound', position: region.start };
+          }
+        }
       }
     }
     const configured = typeof settings.sequenceEnd === 'string' || typeof settings.sequenceEnd === 'number'
@@ -134,25 +214,34 @@
     const terms = previousTerms(fragment);
     if (!terms.length) return null;
     let last = terms[terms.length - 1];
+    const previous = terms[terms.length - 2];
+    // A partially typed product (a_2b_) initially contains only its first
+    // complete factor. Complete it from the preceding whole-product template.
+    if (previous && previous.number !== null && last.number === previous.number + 1 &&
+        last.parts.length < previous.parts.length && sameParts(last.parts, previous.parts.slice(0, last.parts.length)) &&
+        /^,\s*$/.test(fragment.slice(previous.end, last.start))) {
+      terms.pop();
+      last = previous;
+    }
+    if (last.number === null) return null;
     let tail = fragment.slice(last.end);
     let partial = '';
     let separator;
     let trailingComma = false;
     let runEnd = terms.length - 1;
     let second = last;
-    const partialMatch = new RegExp(String.raw`^(,\s*)` + escapeRegex(last.base) + String.raw`\s*_\s*(\{?)(\d*)$`).exec(tail);
-    if (partialMatch) {
-      const nextNumber = String(last.number + 1);
-      if (!nextNumber.startsWith(partialMatch[3])) return null;
-      const usesBrace = partialMatch[2] === '{';
-      partial = nextNumber.slice(partialMatch[3].length) + (usesBrace ? '}' : '');
+    const ellipsisTail = /^\s*,\s*(\\(?:l|c)?dots(?![A-Za-z])|\.{3}|…)([\s\S]*)$/.exec(tail);
+    const partialMatch = !ellipsisTail && /^(,\s*)([\s\S]+)$/.exec(tail);
+    const next = partialMatch && partialMatch[2].includes('_') && completeTerm(last.parts, String(last.number + 1), partialMatch[2]);
+    if (next) {
+      partial = next.suffix;
       separator = partialMatch[1];
-      second = { ...last, number: last.number + 1, braced: usesBrace, end: fragment.length };
+      second = { ...last, number: last.number + 1, parts: next.parts, end: fragment.length };
     } else {
-      if (!/^\s*,?\s*$/.test(tail)) return null;
+      if (!ellipsisTail && !/^\s*,?\s*$/.test(tail)) return null;
       trailingComma = tail.includes(',');
       const previous = terms[terms.length - 2];
-      if (!previous || compact(previous.base) !== compact(last.base) || last.number !== previous.number + 1) return null;
+      if (!previous || previous.number === null || !sameParts(previous.parts, last.parts) || last.number !== previous.number + 1) return null;
       separator = fragment.slice(previous.end, last.start);
       if (!/^,\s*$/.test(separator)) return null;
       runEnd--;
@@ -160,21 +249,29 @@
     let first = terms[runEnd];
     while (runEnd > 0) {
       const candidate = terms[runEnd - 1];
-      if (compact(candidate.base) !== compact(first.base) || candidate.number + 1 !== first.number ||
+      if (candidate.number === null || !sameParts(candidate.parts, first.parts) || candidate.number + 1 !== first.number ||
           !/^,\s*$/.test(fragment.slice(candidate.end, first.start))) break;
       first = candidate;
       runEnd--;
     }
     // A malformed earlier list must not be silently turned into a new consecutive run.
     if (runEnd > 0 && /^,\s*$/.test(fragment.slice(terms[runEnd - 1].end, first.start))) return null;
-    const endpoint = inferEndpoint(parsed, second.base, first.number, cursor, settings);
+    const endpoint = inferEndpoint(parsed, second.parts, first.number, cursor, settings);
     if (/^\d+$/.test(endpoint.value) && Number(endpoint.value) <= second.number) return null;
-    const endingTerm = second.base + '_' + indexText(endpoint.value, second.braced);
+    const afterDots = ellipsisTail && /^(\s*,\s*)([^\r\n]*)$/.exec(ellipsisTail[2]);
+    if (ellipsisTail && !afterDots && ellipsisTail[2].trim()) return null;
+    const typedEnd = afterDots?.[2] || '';
+    const ending = completeTerm(second.parts, endpoint.value, typedEnd);
+    if (!ending) return null;
     let suffix;
-    if (/^\d+$/.test(endpoint.value) && Number(endpoint.value) === second.number + 1) {
-      suffix = partial + (trailingComma ? separator.slice(tail.length) : separator) + endingTerm;
+    if (ellipsisTail) {
+      // Preserve an ellipsis already typed by the user and fill only the missing
+      // comma/endpoint, including a partially typed base or subscript.
+      suffix = (afterDots ? '' : separator) + ending.suffix;
+    } else if (/^\d+$/.test(endpoint.value) && Number(endpoint.value) === second.number + 1) {
+      suffix = partial + (trailingComma ? separator.slice(tail.length) : separator) + ending.text;
     } else {
-      suffix = partial + (trailingComma ? separator.slice(Math.min(tail.length, separator.length)) : separator) + endpoint.dots + separator + endingTerm;
+      suffix = partial + (trailingComma ? separator.slice(Math.min(tail.length, separator.length)) : separator) + endpoint.dots + separator + ending.text;
     }
     const beforeRun = fragment.slice(0, first.start).trimEnd();
     if (beforeRun.endsWith('\\left\\{')) suffix += '\\right\\}';
@@ -361,10 +458,10 @@
 
   function observedIndices(segment) {
     const found = [];
-    const pattern = new RegExp('(' + BASE_SOURCE + ')' + '\\s*_\\s*', 'g');
+    const pattern = new RegExp('(' + INDEXED_BASE_SOURCE + ')' + '\\s*_\\s*', 'g');
     let match;
     while ((match = pattern.exec(segment.text))) {
-      if (escaped(segment.text, match.index)) continue;
+      if (!baseStartsAt(segment.text, match.index)) continue;
       const start = pattern.lastIndex;
       let content, end;
       if (segment.text[start] === '{') {
@@ -392,13 +489,18 @@
 
   function indexSuggestions(context, parsed, text, cursor, settings) {
     const index = context.classification?.index;
-    if (context.classification?.kind !== 'index' || !index?.base) return [];
+    if (context.classification?.kind !== 'index' || !index) return [];
     const typed = index.content || '';
+    const beforeIndex = context.prefix.slice(0, context.prefix.length - typed.length - (index.braced ? 1 : 0))
+      .replace(/_\s*$/, '').trimEnd();
+    const baseMatch = new RegExp('(' + INDEXED_BASE_SOURCE + ')$').exec(beforeIndex);
+    if (!baseMatch || !baseStartsAt(beforeIndex, baseMatch.index)) return [];
+    const base = Classifier.canonicalSymbol(baseMatch[1]);
     const needle = compact(typed);
     const proposals = [];
     for (const segment of context.segments) {
       for (const source of observedIndices(segment)) {
-        if (Classifier.canonicalSymbol(source.base) !== Classifier.canonicalSymbol(index.base)) continue;
+        if (Classifier.canonicalSymbol(source.base) !== base) continue;
         // A suffix cannot add braces before an already typed unbraced command.
         // Reusing a composite argument here would change the subscript's meaning.
         if (!index.braced && typed && !/^(?:[A-Za-z0-9]|\\[A-Za-z]+)$/.test(source.content.trim())) continue;

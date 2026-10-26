@@ -422,6 +422,85 @@ test("indexed sequence insertion respects the existing closing brace", async (t)
   assert.equal(await documentText(page), "${x_1,x_2,\\ldots,x_n}$");
 });
 
+test("the installed model completes a multi-character list after typed dots and supports Undo", async (t) => {
+  const page = await fixture(t, { bundledModel: true });
+  const before = await setDocument(page, "$ba_1,ba_2,...|$");
+  assert.equal(await ghostText(page), ",ba_n");
+  assert.equal(await documentText(page), before);
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), "$ba_1,ba_2,...,ba_n$");
+  await noGhost(page);
+  await page.keyboard.press(process.platform === "darwin" ? "Meta+z" : "Control+z");
+  assert.equal(await documentText(page), before);
+  await noGhost(page);
+});
+
+test("multi-character lists use the matching document endpoint without replacing typed dots", async (t) => {
+  const page = await fixture(t);
+  const prior = "$ba_1,ba_2,\\cdots,ba_M$\n";
+  await setDocument(page, prior + "$ba_1,ba_2,...,|$");
+  assert.equal(await ghostText(page), "ba_M");
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), prior + "$ba_1,ba_2,...,ba_M$");
+  await noGhost(page);
+});
+
+test("multi-character sequence completions preserve braced indices and finish a partial second index", async (t) => {
+  const page = await fixture(t);
+  await setDocument(page, "${ba_{1},ba_{2},...|}$");
+  assert.equal(await ghostText(page), ",ba_{n}");
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), "${ba_{1},ba_{2},...,ba_{n}}$");
+  await noGhost(page);
+  await setDocument(page, "$ba_1,ba_|$");
+  assert.equal(await ghostText(page), "2,\\ldots,ba_n");
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), "$ba_1,ba_2,\\ldots,ba_n$");
+  await noGhost(page);
+});
+
+test("the installed model advances product indices together and supports Undo", async (t) => {
+  const page = await fixture(t, { bundledModel: true });
+  const before = await setDocument(page, "$a_1b_1,a_2b_2,...|$");
+  assert.equal(await ghostText(page), ",a_nb_n");
+  assert.equal(await documentText(page), before);
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), "$a_1b_1,a_2b_2,...,a_nb_n$");
+  await noGhost(page);
+  await page.keyboard.press(process.platform === "darwin" ? "Meta+z" : "Control+z");
+  assert.equal(await documentText(page), before);
+  await noGhost(page);
+});
+
+test("product lists preserve per-factor braces and use matching whole-product endpoints", async (t) => {
+  const page = await fixture(t);
+  await setDocument(page, "${a_{1}b_1,a_{2}b_2,...|}$");
+  assert.equal(await ghostText(page), ",a_{n}b_n");
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), "${a_{1}b_1,a_{2}b_2,...,a_{n}b_n}$");
+  await noGhost(page);
+  const prior = "$a_1b_1,a_2b_2,\\cdots,a_Mb_M$\n";
+  await setDocument(page, prior + "$a_1b_1,a_2b_2,...,|$");
+  assert.equal(await ghostText(page), "a_Mb_M");
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), prior + "$a_1b_1,a_2b_2,...,a_Mb_M$");
+  await noGhost(page);
+});
+
+test("product lists finish a partial second term and a partial synchronized endpoint", async (t) => {
+  const page = await fixture(t);
+  await setDocument(page, "$a_1b_1,a_2b_|$");
+  assert.equal(await ghostText(page), "2,\\ldots,a_nb_n");
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), "$a_1b_1,a_2b_2,\\ldots,a_nb_n$");
+  await noGhost(page);
+  await setDocument(page, "$a_1b_1,a_2b_2,...,a_nb_|$");
+  assert.equal(await ghostText(page), "n");
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), "$a_1b_1,a_2b_2,...,a_nb_n$");
+  await noGhost(page);
+});
+
 test("switching to a new document clears suggestions and old expression sources", async (t) => {
   const page = await fixture(t);
   await setDocument(page, "$a^2 + b^2 = c^2$\n$a^2|$");

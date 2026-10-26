@@ -97,6 +97,144 @@ test('supports braced indices Greek variables and styled variable bases', () => 
   assert.equal(suffix('$' + '{x}_1,{x}_2|$'), ',\\ldots,{x}_n');
 });
 
+test('indexed sequences preserve the complete repeated element before the subscript', () => {
+  for (const base of ['ba', 'abc', 'A2', 'b\\alpha', '\\alpha\\beta', '{ba}', '\\mathbf{ba}', '\\mathbf {ba}']) {
+    const result = suggest('$' + base + '_1,' + base + '_2|$');
+    assert.equal(result?.kind, 'sequence', base);
+    assert.equal(result.insertText, ',\\ldots,' + base + '_n', base);
+  }
+  assert.equal(suffix('$ba_{1}, ba_{2}|$'), ', \\ldots, ba_{n}');
+  assert.equal(suffix('$ba_1,ba_|$'), '2,\\ldots,ba_n');
+  assert.equal(suffix('$ba_{1},ba_{|$'), '2},\\ldots,ba_{n}');
+  assert.equal(suffix('$ba_1,ba_2|$', { sequenceEnd: '10' }), ',\\ldots,ba_{10}');
+});
+
+test('typed ellipses complete only the missing endpoint and preserve the typed text', () => {
+  for (const dots of ['...', '\\ldots', '\\cdots', '\\dots', '…']) {
+    assert.equal(suffix('$ba_1,ba_2,' + dots + '|$'), ',ba_n', dots);
+    assert.equal(suffix('$ba_1, ba_2, ' + dots + ', |$'), 'ba_n', dots);
+    assert.equal(suffix('$ba_1,ba_2,' + dots + ',b|$'), 'a_n', dots);
+    assert.equal(suffix('$ba_1,ba_2,' + dots + ',ba_|$'), 'n', dots);
+  }
+  assert.equal(suffix('$ba_{1}, ba_{2},\\ldots,ba_{|$'), 'n}');
+  assert.equal(suffix('$ba_1,ba_2,...,ba_{|$'), 'n}');
+  assert.equal(suffix('$ba_1,ba_2,...|$', { sequenceEnd: '3' }), ',ba_3');
+  assert.equal(suffix('$\\{ba_1,ba_2,...|\\}$'), ',ba_n');
+});
+
+test('product lists advance every synchronized index while preserving factor order and braces', () => {
+  for (const [input, expected] of [
+    ['$a_1b_1,a_2b_2|$', ',\\ldots,a_nb_n'],
+    ['$a_1b_1,a_2b_2,...|$', ',a_nb_n'],
+    ['$a_{1}b_1, a_{2}b_2|$', ', \\ldots, a_{n}b_n'],
+    ['$a_1b_{1},a_2b_{2},\\cdots,|$', 'a_nb_{n}'],
+    ['$a_1b_1c_1,a_2b_2c_2|$', ',\\ldots,a_nb_nc_n'],
+    ['$ab_1\\alpha_1,ab_2\\alpha_2|$', ',\\ldots,ab_n\\alpha_n'],
+    ['$\\mathbf{x}_{1}y_1,\\mathbf{x}_{2}y_2|$', ',\\ldots,\\mathbf{x}_{n}y_n'],
+    ['$a_1 b_1, a_2 b_2|$', ', \\ldots, a_n b_n'],
+    ['$\\{a_1b_1,a_2b_2,...|\\}$', ',a_nb_n'],
+  ]) assert.equal(suffix(input), expected, input);
+  assert.equal(suffix('$a_1b_1,a_2b_2|$', { sequenceEnd: '10' }), ',\\ldots,a_{10}b_{10}');
+  assert.equal(suffix('$a_1b_1,a_2b_2|$', { sequenceEnd: '3' }), ',a_3b_3');
+});
+
+test('product list completions finish partial second terms and partial endpoints', () => {
+  for (const [input, expected] of [
+    ['$a_1b_1,a_|$', '2b_2,\\ldots,a_nb_n'],
+    ['$a_1b_1,a_2|$', 'b_2,\\ldots,a_nb_n'],
+    ['$a_1b_1,a_2b_|$', '2,\\ldots,a_nb_n'],
+    ['$a_{1}b_{1},a_{2}b_{|$', '2},\\ldots,a_{n}b_{n}'],
+    ['$a_1b_1,a_2b_2,...,a_|$', 'nb_n'],
+    ['$a_1b_1,a_2b_2,...,a_nb_|$', 'n'],
+    ['$a_1b_1,a_2b_2,...,a_{n}b_{|$', 'n}'],
+  ]) assert.equal(suffix(input), expected, input);
+});
+
+test('product endpoints and bounds must match the whole synchronized pattern', () => {
+  assert.equal(suffix('$a_1b_1,a_2b_2,\\cdots,a_Mb_M$\n$a_1b_1,a_2b_2|$'), ',\\cdots,a_Mb_M');
+  assert.equal(suffix('$a_1b_1,a_2b_2,\\ldots,a_{m-1}b_{m-1}$\n$a_1b_1,a_2b_2,...|$'), ',a_{m-1}b_{m-1}');
+  assert.equal(suffix('$a_ib_i,1\\le i\\le M$\n$a_1b_1,a_2b_2|$'), ',\\ldots,a_Mb_M');
+  for (const evidence of ['a_1,a_2,\\ldots,a_M', 'b_1a_1,b_2a_2,\\ldots,b_Ma_M',
+    'a_1b_2,a_2b_3,\\ldots,a_Mb_M', 'a_1b_1,a_2b_2,\\ldots,a_Mb_N',
+    'a_ib_j,1\\le i\\le M', 'a_i,1\\le i\\le M', 'a_ib_ic_i,1\\le i\\le M',
+    'a_ib_i\\gamma_i,1\\le i\\le M']) {
+    assert.equal(suffix('$' + evidence + '$\n$a_1b_1,a_2b_2|$', { expressions: false }), ',\\ldots,a_nb_n', evidence);
+  }
+  assert.equal(suffix('$c_i a_i b_i,1\\le i\\le M$\n$a_1b_1,a_2b_2|$', { expressions: false }), ',\\ldots,a_nb_n');
+});
+
+test('inconsistent products cannot turn into a valid last-factor sequence', () => {
+  const engine = createEngine({ expressions: false });
+  for (const marked of ['$a_1b_2,a_2b_3|$', '$a_1b_1,a_2c_2|$', '$a_1b_1,b_2a_2|$',
+    '$a_1b_2,a_2b_2,a_3b_3|$', '$a_1b_j,a_2b_2,a_3b_3|$', '$a_jb_1,a_2b_2,a_3b_3|$',
+    '$a_1b_1,a_2b_3,...|$', '$a_1b_1,a_2b_2,...,a_nb_m|$']) {
+    const text = marked.replace('|', '');
+    assert.equal(engine.suggest(text, marked.indexOf('|')), null, marked);
+  }
+});
+
+test('sequence endpoint lookup searches the open document using the entire element', () => {
+  assert.equal(suffix('$ba_1,ba_2,\\cdots,ba_M$\n$ba_1,ba_2|$'), ',\\cdots,ba_M');
+  assert.equal(suffix('$ba_1,ba_2,\\cdots,ba_M$\n$ba_1,ba_2,...,|$'), 'ba_M');
+  assert.equal(suffix('$ba _{1},ba _{2},\\ldots,ba _{N}$\n$ba_1,ba_2|$'), ',\\ldots,ba_N');
+  assert.equal(suffix('$ba_i,1\\le i\\le q$\n$ba_1,ba_2|$'), ',\\ldots,ba_q');
+  assert.equal(suffix('$ba_1,ba_2|$\n$ba_1,ba_2,\\ldots,ba_M$'), ',\\ldots,ba_M');
+  const local = '\\begin{enumerate}\\item $ba_1,ba_2,\\ldots,ba_N$' +
+    '\\item $ba_i,1\\le i\\le m$ $ba_1,ba_2,...|$\\end{enumerate}';
+  assert.equal(suffix(local), ',ba_m');
+});
+
+test('similar element suffixes cannot supply unrelated sequence endpoints', () => {
+  for (const [evidence, base] of [
+    ['ba_i,1\\le i\\le q', 'a'],
+    ['cba_i,1\\le i\\le q', 'ba'],
+    ['\\ba_i,1\\le i\\le q', 'ba'],
+    ['a_i,1\\le i\\le q', 'ba'],
+    ['ba_i,xi=1,\\ldots,q', 'ba'],
+    ['ba_i,21\\le i\\le q', 'ba'],
+    ['ba_1,a_2,\\ldots,a_q', 'a'],
+    ['cba_1,ba_2,\\ldots,ba_q', 'ba'],
+    ['ba_1,ba_2,\\ldots,ba_NN', 'ba'],
+  ]) assert.equal(suffix('$' + evidence + '$\n$' + base + '_1,' + base + '_2|$', { expressions: false }), ',\\ldots,' + base + '_n', evidence);
+  assert.equal(suffix('$ba_i,xi=1,\\ldots,q; i=1,\\ldots,m$\n$ba_1,ba_2|$'), ',\\ldots,ba_m');
+});
+
+test('mixed elements and malformed list tails do not become indexed sequence completions', () => {
+  const engine = createEngine();
+  for (const marked of ['$ba_1,ca_2|$', '$ba_1,ba_3|$', '$ba_1,ba_2,...,ca_|$',
+    '$ba_1,ba_2,....|$', '$ba_1,ba_2,\\dotsfoo|$', '$ba_1,ba_2,...+|$']) {
+    const text = marked.replace('|', '');
+    const collected = engine.collectCandidates(text, marked.indexOf('|'));
+    assert.ok(!collected.candidates.some((candidate) => candidate.kind === 'sequence'), marked);
+  }
+});
+
+test('observed index reuse distinguishes compound elements from their last symbol', () => {
+  const engine = createEngine();
+  for (const [evidence, typed] of [['a_j', 'ba_'], ['cba_j', 'ba_'], ['ba_j', 'a_']]) {
+    const text = '$' + evidence + '$\n$' + typed;
+    assert.ok(!engine.collectCandidates(text, text.length).candidates.some((candidate) => candidate.kind === 'index'), text);
+  }
+  for (const base of ['ba', '{ba}', '\\mathbf{ba}', 'b\\alpha']) {
+    const result = suggest('$' + base + '_{j,k}$\n$' + base + '_{|$');
+    assert.equal(result.kind, 'index', base);
+    assert.equal(result.insertText, 'j,k}', base);
+  }
+});
+
+test('failed list matches remain bounded for repeated styled elements', () => {
+  // Run separately so a backtracking regression fails instead of hanging this suite.
+  const { spawnSync } = require('node:child_process');
+  const script = `const { createEngine } = require('./extension/engine.js');
+    const { createUntrainedArtifact } = require('./extension/predictor.js');
+    const e = createEngine({ model: createUntrainedArtifact(), expressions: false });
+    const text = '$' + '\\\\mathbf{x}'.repeat(80);
+    if (e.suggest(text, text.length) !== null) process.exitCode = 1;`;
+  const result = spawnSync(process.execPath, ['-e', script], { cwd: require('node:path').resolve(__dirname, '..'), timeout: 3000 });
+  assert.equal(result.error, undefined, result.error?.message);
+  assert.equal(result.status, 0, result.stderr.toString());
+});
+
 test('completes a sufficiently clear partial second index', () => {
   assert.equal(suffix('$x_1,x_|$'), '2,\\ldots,x_n');
   assert.equal(suffix('$x_{1}, x_{|$'), '2}, \\ldots, x_{n}');
