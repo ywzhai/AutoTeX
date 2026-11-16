@@ -7,15 +7,19 @@
     expressions: true,
     sequences: true,
     autoFractions: true,
+    automaticSuggestions: true,
     minPrefix: 3,
     maxSuggestionLength: 400,
     sequenceEnd: "n",
     debounceMs: 50,
   };
-  const checkboxes = ["enabled", "expressions", "sequences", "autoFractions"];
+  const checkboxes = ["enabled", "expressions", "sequences", "autoFractions", "automaticSuggestions"];
   const controls = Object.fromEntries(checkboxes.map((name) => [name, document.getElementById(name)]));
   const endInput = document.getElementById("sequence-end");
   const endError = document.getElementById("sequence-error");
+  const delayInput = document.getElementById("suggestion-delay");
+  const prefixInput = document.getElementById("min-prefix");
+  const prefixError = document.getElementById("prefix-error");
   const saveStatus = document.getElementById("save-status");
   const connectionStatus = document.getElementById("connection-status");
   const connectionLabel = document.getElementById("connection-label");
@@ -53,6 +57,8 @@
       controls[name].disabled = !ready;
     }
     endInput.disabled = !ready || !settings.sequences;
+    delayInput.disabled = !ready || !settings.automaticSuggestions;
+    prefixInput.disabled = !ready || !settings.expressions;
     renderConnection();
   }
 
@@ -84,6 +90,17 @@
     save();
   }
 
+  function savePrefix() {
+    const raw = prefixInput.value.trim();
+    const value = Number(raw);
+    const valid = /^\d{1,2}$/.test(raw) && Number.isInteger(value) && value >= 1 && value <= 20;
+    prefixInput.setAttribute("aria-invalid", String(!valid));
+    prefixError.hidden = valid;
+    if (!valid || settings.minPrefix === value) return;
+    settings.minPrefix = value;
+    save();
+  }
+
   for (const name of checkboxes) {
     controls[name].addEventListener("change", () => {
       settings[name] = controls[name].checked;
@@ -105,6 +122,21 @@
       saveEnd();
       if (!endError.hidden) return;
       endInput.blur();
+    }
+  });
+
+  delayInput.addEventListener("change", () => {
+    const value = Number(delayInput.value);
+    if (!Number.isInteger(value) || value < 0 || value > 2000) return;
+    settings.debounceMs = value;
+    save();
+  });
+  prefixInput.addEventListener("input", savePrefix);
+  prefixInput.addEventListener("change", savePrefix);
+  prefixInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      savePrefix();
+      if (prefixError.hidden) prefixInput.blur();
     }
   });
 
@@ -139,6 +171,12 @@
       }
       ready = true;
       endInput.value = settings.sequenceEnd;
+      prefixInput.value = settings.minPrefix;
+      // Keep a previously configured delay visible instead of silently replacing it.
+      if (!Array.from(delayInput.options).some((option) => Number(option.value) === settings.debounceMs)) {
+        delayInput.add(new Option("Custom · " + settings.debounceMs + " ms", String(settings.debounceMs)));
+      }
+      delayInput.value = String(settings.debounceMs);
       updateControls();
     } catch {
       setSaveStatus("Couldn’t load settings. Reopen this popup to retry.", "error");

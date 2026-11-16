@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AutoTeX",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Local mathematical completions for Overleaf, prioritizing the current answer. Grey previews and Tab acceptance. Unofficial.",
   "minimum_chrome_version": "111",
   "permissions": [

@@ -15,6 +15,7 @@
     expressions: true,
     sequences: true,
     autoFractions: true,
+    automaticSuggestions: true,
     minPrefix: 3,
     maxSuggestionLength: 400,
     sequenceEnd: 'n',
@@ -546,15 +547,15 @@
 
   // The offline evaluator uses this same selection policy. Low corpus confidence
   // must not disable a concrete completion already supported by the document.
-  function selectCandidate(ranked, threshold = 0, useLearnedRanking = false) {
-    if (!Array.isArray(ranked) || !ranked.length) return null;
+  function selectCandidates(ranked, threshold = 0, useLearnedRanking = false) {
+    if (!Array.isArray(ranked) || !ranked.length) return [];
     const tier = (candidate) => candidate.itemTier ?? candidate.scopeTier ?? 0;
     const isReliable = (candidate) => candidate.reliable ||
       candidate.kind === 'expression' || candidate.kind === 'sequence';
     // Rejected predictions are not eligible to block a lower-scope reuse.
     const eligible = ranked.filter((candidate) => isReliable(candidate) ||
       (Number.isFinite(candidate.score) && candidate.score >= threshold));
-    if (!eligible.length) return null;
+    if (!eligible.length) return [];
     const bestTier = Math.max(...eligible.map(tier));
     const scoped = eligible.filter((candidate) => tier(candidate) === bestTier);
     if (useLearnedRanking) {
@@ -564,18 +565,22 @@
         (b.semanticScore || 0) - (a.semanticScore || 0) ||
         (b.legacyScore || 0) - (a.legacyScore || 0) ||
         (a.insertText || '').localeCompare(b.insertText || ''));
-      return scoped[0];
+      return scoped;
     }
     const reliable = scoped.filter(isReliable);
     reliable.sort((a, b) => (b.semanticScore || 0) - (a.semanticScore || 0) ||
       Number(b.kind === 'sequence') - Number(a.kind === 'sequence') ||
       (b.legacyScore || 0) - (a.legacyScore || 0) ||
       (a.insertText || '').localeCompare(b.insertText || ''));
-    if (reliable.length) return reliable[0];
-    scoped.sort((a, b) => (b.score || 0) - (a.score || 0) ||
+    const predictions = scoped.filter((candidate) => !isReliable(candidate));
+    predictions.sort((a, b) => (b.score || 0) - (a.score || 0) ||
       (b.insertText || '').length - (a.insertText || '').length ||
       (a.insertText || '').localeCompare(b.insertText || ''));
-    return Number.isFinite(scoped[0]?.score) && scoped[0].score >= threshold ? scoped[0] : null;
+    return [...reliable, ...predictions];
+  }
+
+  function selectCandidate(ranked, threshold = 0, useLearnedRanking = false) {
+    return selectCandidates(ranked, threshold, useLearnedRanking)[0] || null;
   }
 
   function declarationContext(parsed, active, cursor) {
@@ -893,16 +898,24 @@
       return { candidates: predictor.prepareCandidates([...unique.values()].sort((a, b) => b.itemTier - a.itemTier).slice(0, 32), context), context };
     }
 
+    function suggestAlternatives(documentText, cursor, overrides, limit = 5) {
+      const collected = collectCandidates(documentText, cursor, overrides);
+      if (!collected?.candidates.length) return [];
+      const ranked = predictor.rank(collected.candidates, collected.context);
+      const threshold = predictor.trained && Number.isFinite(artifact?.training?.recommendedThreshold)
+        ? Math.max(0, Math.min(1, artifact.training.recommendedThreshold)) : 0;
+      const count = Number.isInteger(limit) ? Math.max(1, Math.min(5, limit)) : 5;
+      // Alternative previews obey the same confidence and answer-scope policy
+      // as the first suggestion; browsing never exposes rejected predictions.
+      return selectCandidates(ranked, threshold, predictor.trained).slice(0, count);
+    }
+
     return {
       collectCandidates,
       rankCandidates(candidates, context) { return predictor.rank(candidates, context); },
+      suggestAlternatives,
       suggest(documentText, cursor, overrides) {
-        const collected = collectCandidates(documentText, cursor, overrides);
-        if (!collected?.candidates.length) return null;
-        const ranked = predictor.rank(collected.candidates, collected.context);
-        const threshold = predictor.trained && Number.isFinite(artifact?.training?.recommendedThreshold)
-          ? Math.max(0, Math.min(1, artifact.training.recommendedThreshold)) : 0;
-        return selectCandidate(ranked, threshold, predictor.trained);
+        return suggestAlternatives(documentText, cursor, overrides, 1)[0] || null;
       },
       isMathContext(documentText, cursor) {
         return typeof documentText === 'string' && Boolean(Context.contextAt(parse(documentText), cursor));

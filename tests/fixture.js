@@ -15,6 +15,7 @@ const settings = {
   expressions: true,
   sequences: true,
   autoFractions: true,
+  automaticSuggestions: true,
   minPrefix: 3,
   maxSuggestionLength: 400,
   sequenceEnd: "n",

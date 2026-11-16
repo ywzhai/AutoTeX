@@ -9,6 +9,7 @@
     expressions: true,
     sequences: true,
     autoFractions: true,
+    automaticSuggestions: true,
     minPrefix: 3,
     maxSuggestionLength: 400,
     sequenceEnd: "n",
@@ -21,7 +22,7 @@
   function normalizeSettings(value) {
     const source = value && typeof value === "object" ? value : {};
     const result = { ...DEFAULTS };
-    for (const name of ["enabled", "expressions", "sequences", "autoFractions"]) {
+    for (const name of ["enabled", "expressions", "sequences", "autoFractions", "automaticSuggestions"]) {
       if (typeof source[name] === "boolean") result[name] = source[name];
     }
     const end = typeof source.sequenceEnd === "string" ? source.sequenceEnd.trim() : "";

@@ -634,6 +634,48 @@ test('engine feedback uses displayed snapshots and clears calibration on model r
   assert.equal(engine.feedback(next, true), false);
 });
 
+test('alternative suggestions keep the primary choice and are distinct and bounded', () => {
+  const engine = createEngine();
+  const text = Array.from({ length: 8 }, (_, n) => '$f(x)=x+' + n + '$').join('\n') + '\n$f(x)';
+  const candidates = engine.suggestAlternatives(text, text.length);
+  assert.equal(candidates.length, 5);
+  assert.equal(new Set(candidates.map((candidate) => candidate.insertText)).size, candidates.length);
+  assert.equal(candidates[0].insertText, engine.suggest(text, text.length).insertText);
+  assert.equal(engine.suggestAlternatives(text, text.length, {}, 2).length, 2);
+  assert.equal(engine.suggestAlternatives(text, text.length, {}, 100).length, 5);
+  assert.equal(engine.calibrationState().updates, 0, 'Browsing does not teach acceptance or rejection');
+});
+
+test('alternative suggestions retain current-answer priority and all math and preference gates', () => {
+  const engine = createEngine();
+  const text = String.raw`\begin{enumerate}\item $f(x)=x+1$ $f(x)=x+2$\item $f(x)=x+3$ $f(x)=x+4$ $f(x)`;
+  const candidates = engine.suggestAlternatives(text, text.length);
+  assert.ok(candidates.length >= 2);
+  assert.ok(candidates.every((candidate) => candidate.itemTier === 2));
+  assert.ok(!candidates.some((candidate) => /x\+[12]$/.test(candidate.insertText)));
+  assert.deepEqual(engine.suggestAlternatives(text, text.length, { enabled: false }), []);
+  assert.deepEqual(engine.suggestAlternatives(text, text.length, { expressions: false, sequences: false }), []);
+  for (const outsideMath of ['$f(x)=x+1$ Prose f(x)', '$\\text{f(x)']) {
+    assert.deepEqual(engine.suggestAlternatives(outsideMath, outsideMath.length), []);
+  }
+});
+
+test('alternative browsing preserves the learned threshold and document-supported fallback', () => {
+  const artifact = { ...Predictor.createUntrainedArtifact(), trained: true,
+    ranker: { features: [...Predictor.FEATURE_NAMES], weights: Predictor.FEATURE_NAMES.map(() => 0),
+      means: Predictor.FEATURE_NAMES.map(() => 0), scales: Predictor.FEATURE_NAMES.map(() => 1), bias: -30 },
+    training: { recommendedThreshold: 0.99 } };
+  const engine = createEngine({ model: artifact });
+  const text = '$f(x)=x+1$\n$f(x)=x+2$\n$f(x)';
+  const candidates = engine.suggestAlternatives(text, text.length);
+  assert.ok(candidates.length >= 2);
+  assert.ok(candidates.every((candidate) => candidate.reliable || ['expression', 'sequence'].includes(candidate.kind)));
+  assert.equal(candidates[0].insertText, engine.suggest(text, text.length).insertText);
+  const generatedOnly = '$x^2+y^2=z^2$\n$x^2+';
+  assert.ok(engine.suggestAlternatives(generatedOnly, generatedOnly.length).every((candidate) =>
+    candidate.reliable || ['expression', 'sequence'].includes(candidate.kind)));
+});
+
 test('underscores reuse indices for the same base while respecting scope and braces', () => {
   assert.equal(suffix('$a_{i+1}$ and $x_{j,k}$ then $x_{|}$'), 'j,k');
   assert.equal(suffix('$x_{j,k}$ then $x_|$'), '{j,k}');

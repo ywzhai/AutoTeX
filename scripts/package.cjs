@@ -30,6 +30,9 @@ entries.push({ name: "INSTALL.txt", bytes: Buffer.from(
   "Type within LaTeX math to reuse document expressions, continue math patterns,\r\n" +
   "or extend a sequence such as x_1,x_2. Grey text previews the continuation.\r\n" +
   "Tab accepts. Esc dismisses. Undo removes acceptance.\r\n\r\n" +
+  "Alt+\\ requests a preview. Alt+[ and Alt+] browse alternative suggestions.\r\n" +
+  "On Mac, use Option instead of Alt. The popup supports manual-only suggestions,\r\n" +
+  "typing delay and prefix-length controls, and system light/dark themes.\r\n\r\n" +
   "Type PQ/ in math to create \\frac{PQ}{} with the cursor in the denominator.\r\n" +
   "The numerator stops at whitespace. Undo reverses the fraction expansion.\r\n" +
   "Turn off Auto fractions in the popup to keep literal slashes.\r\n\r\n" +

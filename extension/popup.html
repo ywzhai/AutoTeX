@@ -40,6 +40,10 @@
           <span>Complete indexed sequences</span>
           <input id="sequences" type="checkbox" checked disabled>
         </label>
+        <label class="option" for="automaticSuggestions">
+          <span>Show suggestions automatically</span>
+          <input id="automaticSuggestions" type="checkbox" checked disabled>
+        </label>
         <div class="sequence-setting">
           <div>
             <label for="sequence-end">Default final index</label>
@@ -48,9 +52,38 @@
           <input id="sequence-end" type="text" value="n" maxlength="3" autocomplete="off" spellcheck="false" aria-describedby="sequence-hint sequence-error" disabled>
         </div>
         <p id="sequence-error" class="error" role="alert" hidden>Enter one letter or a whole number from 3 to 999.</p>
+        <div class="sequence-setting">
+          <div>
+            <label for="suggestion-delay">Suggestion delay</label>
+            <p id="delay-hint">After you stop typing.</p>
+          </div>
+          <select id="suggestion-delay" aria-describedby="delay-hint" disabled>
+            <option value="50">Fast · 50 ms</option>
+            <option value="200">Balanced · 200 ms</option>
+            <option value="500">Relaxed · 500 ms</option>
+          </select>
+        </div>
+        <div class="sequence-setting">
+          <div>
+            <label for="min-prefix">Expression prefix length</label>
+            <p id="prefix-hint">Typed characters before expression previews.</p>
+          </div>
+          <input id="min-prefix" type="number" min="1" max="20" step="1" value="3" inputmode="numeric" aria-describedby="prefix-hint prefix-error" disabled>
+        </div>
+        <p id="prefix-error" class="error" role="alert" hidden>Enter a whole number from 1 to 20.</p>
       </section>
 
-      <p class="shortcuts"><kbd>/</kbd> fraction <span class="separator">·</span> <kbd>Tab</kbd> accept <span class="separator">·</span> <kbd>Esc</kbd> dismiss</p>
+      <section class="shortcuts" aria-label="Keyboard shortcuts">
+        <div class="shortcut-grid">
+          <p><kbd>Alt+\</kbd> Suggest now</p>
+          <p><kbd>/</kbd> Fraction</p>
+          <p><kbd>Alt+[</kbd> Previous</p>
+          <p><kbd>Alt+]</kbd> Next</p>
+          <p><kbd>Tab</kbd> Accept</p>
+          <p><kbd>Esc</kbd> Dismiss</p>
+        </div>
+        <p class="shortcut-note">Use Option instead of Alt on Mac. Turn off automatic suggestions to request them only when needed.</p>
+      </section>
       <p id="save-status" class="save-status" role="status" aria-live="polite"></p>
     </main>
   </body>

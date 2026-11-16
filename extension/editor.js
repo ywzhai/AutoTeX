@@ -129,7 +129,7 @@
         const span = document.createElement("span");
         span.className = "ol-math-ghost";
         span.setAttribute("aria-hidden", "true");
-        span.setAttribute("data-tooltip", "Tab to accept · Esc to dismiss");
+        span.setAttribute("data-tooltip", "Tab to accept · Alt+[ / Alt+] for alternatives · Esc to dismiss");
         span.textContent = this.text;
         return span;
       }
@@ -164,6 +164,7 @@
         this.view = view;
         this.engine = MathAutocompleteEngine.createEngine();
         this.timer = null;
+        this.alternatives = null;
         this.alive = true;
         this.composing = false;
         this.onKey = (event) => this.keydown(event);
@@ -189,6 +190,7 @@
       }
 
       clear() {
+        this.alternatives = null;
         if (this.alive && this.current()) this.view.dispatch({ effects: setSuggestion.of(null) });
       }
 
@@ -200,21 +202,67 @@
 
       schedule() {
         this.cancelTimer();
-        if (!this.alive || this.composing || !(settings.expressions || settings.sequences) || !sourceIsEditable(this.view)) return;
+        if (!settings.automaticSuggestions || !this.canSuggest()) return;
         const document = this.view.state.doc;
         const position = this.view.state.selection.main.head;
         this.timer = setTimeout(() => {
           this.timer = null;
-          if (!this.alive || this.composing || !(settings.expressions || settings.sequences) || !sourceIsEditable(this.view) ||
+          if (!settings.automaticSuggestions || !this.canSuggest() ||
               this.view.state.doc !== document || this.view.state.selection.main.head !== position) return;
-          if (!isMathContext(document, position, this.engine)) return;
-          const result = this.engine.suggest(document.toString(), position, settings);
-          if (!result) return;
-          this.view.dispatch({ effects: setSuggestion.of({ ...result, doc: document, pos: position }) });
+          this.requestSuggestion();
         }, settings.debounceMs);
       }
 
+      canSuggest() {
+        return this.alive && !this.composing && (settings.expressions || settings.sequences) && sourceIsEditable(this.view);
+      }
+
+      requestSuggestion() {
+        if (!this.canSuggest()) return false;
+        const document = this.view.state.doc;
+        const position = this.view.state.selection.main.head;
+        if (!isMathContext(document, position, this.engine)) return false;
+        this.cancelTimer();
+        this.alternatives = null;
+        const result = this.engine.suggest(document.toString(), position, settings);
+        this.view.dispatch({ effects: setSuggestion.of(result ? { ...result, doc: document, pos: position } : null) });
+        return true;
+      }
+
+      visibleSuggestion() {
+        const value = this.current(), view = this.view;
+        return value?.insertText && this.canSuggest() && view.state.doc === value.doc &&
+          view.state.selection.main.head === value.pos &&
+          isMathContext(view.state.doc, value.pos, this.engine) && view.dom.querySelector(".ol-math-ghost") ? value : null;
+      }
+
+      cycleSuggestion(direction) {
+        const current = this.visibleSuggestion();
+        if (!current || typeof this.engine.suggestAlternatives !== "function") return false;
+        this.cancelTimer();
+        let alternatives = this.alternatives;
+        if (!alternatives || alternatives.doc !== current.doc || alternatives.pos !== current.pos) {
+          const candidates = this.engine.suggestAlternatives(current.doc.toString(), current.pos, settings);
+          // Retain a continued preview and its feedback snapshot as the first
+          // choice, even when the user has typed part of the original suggestion.
+          const seen = new Set([current.insertText]);
+          const choices = [current];
+          for (const candidate of candidates) {
+            if (!candidate.insertText || seen.has(candidate.insertText)) continue;
+            seen.add(candidate.insertText);
+            choices.push(candidate);
+            if (choices.length === 5) break;
+          }
+          alternatives = this.alternatives = { doc: current.doc, pos: current.pos, choices, index: 0 };
+        }
+        alternatives.index = (alternatives.index + direction + alternatives.choices.length) % alternatives.choices.length;
+        const chosen = alternatives.choices[alternatives.index];
+        this.view.dispatch({ effects: setSuggestion.of({ ...chosen, doc: current.doc, pos: current.pos }) });
+        return true;
+      }
+
       update(update) {
+        if (update.docChanged || update.selectionSet) this.alternatives = null;
         if (update.docChanged) {
           this.cancelTimer();
           // A continued (or fully typed) suggestion is already current. Do not
@@ -249,8 +297,18 @@
       }
 
       keydown(event) {
-        if (event.defaultPrevented || event.isComposing || this.composing ||
-            event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
+        if (event.defaultPrevented || event.isComposing || this.composing) return;
+        // Option can produce a different character on macOS. The physical key
+        // code keeps these shortcuts available without intercepting AltGr.
+        if (event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey) {
+          const key = event.code || ({ "\\": "Backslash", "[": "BracketLeft", "]": "BracketRight" })[event.key];
+          const handled = key === "Backslash" ? this.requestSuggestion() :
+            key === "BracketLeft" ? this.cycleSuggestion(-1) :
+            key === "BracketRight" ? this.cycleSuggestion(1) : false;
+          if (handled) { event.preventDefault(); event.stopImmediatePropagation(); }
+          return;
+        }
+        if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
         if (event.key === "Escape") {
           const value = this.current();
           const hadSuggestion = Boolean(value?.insertText && this.view.dom.querySelector(".ol-math-ghost"));
@@ -260,12 +318,9 @@
           return;
         }
         if (event.key !== "Tab") return;
-        const value = this.current();
+        const value = this.visibleSuggestion();
         const view = this.view;
-        if (!value || !(settings.expressions || settings.sequences) || !sourceIsEditable(view) || view.state.doc !== value.doc ||
-            view.state.selection.main.head !== value.pos ||
-            !isMathContext(view.state.doc, value.pos, this.engine) ||
-            !view.dom.querySelector(".ol-math-ghost")) return;
+        if (!value) return;
         this.cancelTimer();
         event.preventDefault();
         event.stopImmediatePropagation();
@@ -328,7 +383,7 @@
     const input = event.data.settings;
     if (!input || typeof input !== "object") return;
     // Only settings are accepted across worlds. No message can insert text.
-    for (const key of ["enabled", "expressions", "sequences", "autoFractions"]) {
+    for (const key of ["enabled", "expressions", "sequences", "autoFractions", "automaticSuggestions"]) {
       if (typeof input[key] === "boolean") settings[key] = input[key];
     }
     if (typeof input.sequenceEnd === "string" && /^(?:[A-Za-z]|[0-9]{1,3})$/.test(input.sequenceEnd)) {

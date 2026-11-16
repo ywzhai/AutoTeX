@@ -10,7 +10,7 @@ AutoTeX combines a lightweight expression classifier, document retrieval, and a 
 2. Enable **Developer mode** in the upper-right corner.
 3. Click **Load unpacked** and select the `extension` folder in this project (the folder containing `manifest.json`). If using the release ZIP, extract it first and select the extracted folder containing `manifest.json`.
 4. Open or reload your Overleaf project, then choose **Code Editor**.
-5. Optionally pin **AutoTeX** from Chrome’s extensions menu. Its popup lets you pause AutoTeX, toggle automatic fractions and each suggestion feature independently, and choose a default final index.
+5. Optionally pin **AutoTeX** from Chrome’s extensions menu. Its popup lets you pause AutoTeX, toggle automatic fractions and each suggestion feature independently, choose a default final index, and adjust when suggestions appear. The popup follows your system’s light or dark theme.
 
 The ready-to-load files are already in `extension/`. No build step or dependency installation is required to use the extension. Chrome 111 or newer is required.
 
@@ -50,6 +50,12 @@ Nested indices advance together too. Typing `a=p_1^{k_1}p_2^{k_2}...` previews `
 
 Suggestions first appear after a short typing pause. As you type matching characters, the remaining grey text updates immediately without restarting that delay. Extra spaces between math tokens are preserved, and typing through a suggestion does not switch to another candidate. When a grey suggestion is visible, Tab accepts the remaining text ahead of Overleaf’s other Tab shortcuts. Otherwise, Tab retains its normal behavior. Esc dismisses until another edit. Standard Undo reverses acceptance in one step. Typing different content, moving the cursor, selecting text, or leaving the editor dismisses the preview.
 
+Press **Alt+\** to request a suggestion immediately, including after dismissing one or moving the cursor. Turn off **Show suggestions automatically** in the popup for manual-only suggestions; automatic fractions can still be used independently. On Mac, use **Option** for these Alt shortcuts.
+
+While a preview is visible, **Alt+]** selects the next alternative and **Alt+[** selects the previous one. Up to five distinct choices are available, subject to the same confidence checks and current-answer priority as the initial suggestion. Browsing changes only the preview. Tab accepts the selected choice, and Esc dismisses it; only those explicit actions affect document feedback. Editing or moving the cursor discards the old alternatives.
+
+The popup’s **Suggestion delay** offers 50, 200, and 500 ms pauses. **Expression prefix length** controls how many non-whitespace characters (1–20) are needed for ordinary expression previews; index and sequence completions keep their own pattern checks. Manual requests bypass the delay while retaining the configured prefix length and other eligibility checks.
+
 ## What it recognizes
 
 - **Automatic fractions:** `/` wraps the contiguous math text immediately before the cursor in `\frac{...}{}` and places the cursor in the denominator. The **Auto fractions** switch controls this separately from suggestions.
@@ -61,6 +67,7 @@ Suggestions first appear after a short typing pause. As you type matching charac
 - **Indices:** an unfinished subscript such as `x_{` activates index context. The engine can reuse an index already observed on the same base symbol, including `x_{j,k}` and `x_{i+1}`, preserving existing closing braces. Summation bounds and escaped underscores are distinguished from ordinary subscripts.
 - **Answer scope:** the current `\item` is the span until the next sibling item or the end of its list. Its formulas and token transitions take priority. Nested items have separate scopes and can fall back to their parent, then other answers. This preference is enforced independently of learned ranking weights. Standard `enumerate`, `itemize`, and `description` lists, their starred variants, and bare `\item` fragments are recognized; arbitrary macro-generated lists are not expanded.
 - **Indexed sequences:** recognizes consecutive numeric indices across comma lists, sums, products, subset relations, and other chains. Full bases such as `ba`, synchronized factors such as `a_ib_i`, and nested scripts such as `p_i^{k_i}` retain their structure; fixed powers such as `^2` remain fixed. It preserves the separator, spacing, factor order, and index braces. New comma lists use `\ldots`; other chains use `\cdots`. Already-typed ellipses are completed with only the missing endpoint. It first looks for an endpoint in a matching sequence or a nearby bound for the same full pattern in the current document, then uses the popup’s default (`n`). A default number from 3 to 999 may be set explicitly.
+- **Suggestion controls:** request a preview on demand, browse up to five eligible alternatives, or use manual-only mode. The popup exposes typing delay and expression prefix length, with persistent preferences and a keyboard-shortcut guide.
 - **Safe editing:** previews are native CodeMirror decorations, not temporary document edits. Acceptance uses one editor transaction and preserves standard editing/undo behavior. Suggestions stop for read-only documents, multiple selections, and input-method composition.
 
 Comments, common verbatim/listing environments, text inside math `\text{...}` commands, and label/reference arguments are excluded. Predictions estimate likely notation; they do not prove that an expression is mathematically appropriate. Review the preview before accepting it. Lists use ellipsis notation rather than expanding every intervening index. Generative suggestions currently fill the end of an expression or an automatically paired group; expression reuse can also fill known gaps before existing text.
@@ -90,6 +97,7 @@ This version targets `https://www.overleaf.com/project/*` and `https://overleaf.
 - Use **Code Editor**, ensure the file is editable, and type within a math region.
 - For a repeated expression, the source formula must exist elsewhere in the same open file. For a new indexed sequence, type two consecutive terms such as `x_1,x_2`, `x_1+x_2`, or `p_1^{k_1}p_2^{k_2}`.
 - Check that the feature is enabled in the popup. Its status reports whether the editor connection is active.
+- If automatic suggestions are off, use **Alt+\** in math to request one. If previews feel too frequent, increase the delay or expression prefix length.
 - If Overleaf changes its third-party editor interface, this extension may need an update. It uses Overleaf’s exposed interface, which Overleaf explicitly describes as unstable.
 
 ## Development and validation

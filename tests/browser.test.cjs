@@ -153,6 +153,184 @@ async function feedbackSessions(page) {
   })));
 }
 
+// Simulate the physical shortcut even when Option changes the character produced
+// by the keyboard layout. The synchronous snapshot also proves manual requests
+// do not wait for the automatic suggestion delay.
+async function shortcutSnapshot(page, code, key = code) {
+  return page.evaluate(({ code, key }) => {
+    const event = new KeyboardEvent("keydown", { code, key, altKey: true, bubbles: true, cancelable: true });
+    window.fixture.view.contentDOM.dispatchEvent(event);
+    return { prevented: event.defaultPrevented,
+      ghost: window.fixture.view.dom.querySelector(".ol-math-ghost")?.textContent || "",
+      text: window.fixture.view.state.doc.toString() };
+  }, { code, key });
+}
+
+test("manual suggestions appear immediately and reopen after dismissal without editing", async (t) => {
+  const page = await fixture(t);
+  await page.evaluate(() => window.fixture.configure({ automaticSuggestions: false, debounceMs: 2000 }));
+  const before = await setDocument(page, "$f(x)=x+1$\n$f(x)|$");
+  await noGhost(page);
+  const requested = await shortcutSnapshot(page, "Backslash", "«");
+  assert.deepEqual(requested, { prevented: true, ghost: "=x+1", text: before });
+  await page.keyboard.press("Escape");
+  await noGhost(page);
+  assert.equal((await shortcutSnapshot(page, "Backslash", "«")).ghost, "=x+1");
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), "$f(x)=x+1$\n$f(x)=x+1$");
+  await noGhost(page);
+  await setDocument(page, "$PQ|$");
+  await page.keyboard.press("/");
+  assert.equal(await documentText(page), "$\\frac{PQ}{}$");
+  assert.equal(await page.evaluate(() => window.fixture.view.state.selection.main.head), "$\\frac{PQ}{".length);
+});
+
+test("manual suggestion shortcuts retain math editability and composition guards", async (t) => {
+  const page = await fixture(t);
+  await page.evaluate(() => window.fixture.configure({ automaticSuggestions: false }));
+  for (const marked of ["$f(x)=x+1$\nf(x)|", "$f(x)=x+1$\n$\\text{f(x)|}$", "$f(x)=x+1$\n% $f(x)|"]) {
+    const before = await setDocument(page, marked);
+    const result = await shortcutSnapshot(page, "Backslash", "\\");
+    assert.equal(result.ghost, "", marked);
+    assert.equal(result.text, before, marked);
+  }
+  const modifierDocument = await setDocument(page, "$f(x)=x+1$\n$f(x)|$");
+  for (const modifier of ["ctrlKey", "shiftKey", "metaKey"]) {
+    const result = await page.evaluate((modifier) => {
+      const event = new KeyboardEvent("keydown", {
+        code: "Backslash", key: "\\", altKey: true, [modifier]: true, bubbles: true, cancelable: true,
+      });
+      // Observe after AutoTeX's capture listener and before the host keymap;
+      // CodeMirror may legitimately handle one of these modifier combinations.
+      let prevented = true;
+      window.fixture.view.dom.addEventListener("keydown", (event) => {
+        prevented = event.defaultPrevented;
+      }, { capture: true, once: true });
+      window.fixture.view.contentDOM.dispatchEvent(event);
+      return { prevented,
+        ghost: window.fixture.view.dom.querySelector(".ol-math-ghost")?.textContent || "",
+        text: window.fixture.view.state.doc.toString() };
+    }, modifier);
+    assert.deepEqual(result, { prevented: false, ghost: "", text: modifierDocument }, modifier);
+  }
+  for (const blocked of ["paused", "readOnly", "selection", "composition", "featuresDisabled"]) {
+    await page.evaluate(() => window.fixture.configure({ enabled: true, expressions: true, sequences: true }));
+    const before = await setDocument(page, "$f(x)=x+1$\n$f(x)|$", { readOnly: blocked === "readOnly" });
+    if (blocked === "paused") await page.evaluate(() => window.fixture.configure({ enabled: false }));
+    if (blocked === "featuresDisabled") await page.evaluate(() => window.fixture.configure({ expressions: false, sequences: false }));
+    if (blocked === "selection") await page.evaluate(() => {
+      const position = window.fixture.view.state.selection.main.head;
+      window.fixture.setSelection(position - 1, position);
+    });
+    if (blocked === "composition") await page.evaluate(() => window.fixture.view.contentDOM.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true })));
+    const result = await shortcutSnapshot(page, "Backslash", "\\");
+    assert.equal(result.ghost, "", blocked);
+    assert.equal(result.text, before, blocked);
+    if (blocked === "composition") await page.evaluate(() => window.fixture.view.contentDOM.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true })));
+  }
+});
+
+test("alternative suggestions cycle without edits and accept the selected choice with independent Undo", async (t) => {
+  const page = await fixture(t);
+  await observeFeedback(page);
+  const before = await setDocument(page, "$f(x)=x+1$\n$f(x)=x+2$\n$f(x)|$");
+  const original = await ghostText(page);
+  const next = await shortcutSnapshot(page, "BracketRight", "]");
+  assert.equal(next.prevented, true);
+  assert.notEqual(next.ghost, original);
+  assert.equal(next.text, before);
+  const previous = await shortcutSnapshot(page, "BracketLeft", "[");
+  assert.equal(previous.ghost, original);
+  assert.equal(previous.text, before);
+  const chosen = (await shortcutSnapshot(page, "BracketRight", "]")).ghost;
+  let sessions = await feedbackSessions(page);
+  assert.deepEqual(sessions.at(-1).events, [], "Browsing alternatives must not train acceptance or rejection");
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), before.slice(0, -1) + chosen + "$");
+  sessions = await feedbackSessions(page);
+  assert.equal(sessions.at(-1).events.length, 1);
+  assert.equal(sessions.at(-1).events[0].accepted, true);
+  assert.equal(sessions.at(-1).events[0].insertText, chosen);
+  assert.equal(sessions.at(-1).events[0].finiteFeatures, true);
+  await page.keyboard.press(process.platform === "darwin" ? "Meta+z" : "Control+z");
+  assert.equal(await documentText(page), before);
+  await noGhost(page);
+  assert.equal((await feedbackSessions(page)).at(-1).events.length, 1);
+});
+
+test("cycling a continued preview preserves its original feedback and Undo keeps the typed prefix", async (t) => {
+  const page = await fixture(t);
+  await observeFeedback(page);
+  const before = await setDocument(page, "$f(x)=x+1$\n$f(x)=x+2$\n$f(x)|$");
+  const original = await ghostText(page);
+  assert.ok(original.startsWith("="), "Fixture must offer a shared prefix for both formulas");
+  await page.keyboard.type("=");
+  const continued = await ghostText(page);
+  assert.equal(continued, original.slice(1));
+  const typedDocument = before.slice(0, -1) + "=$";
+  assert.equal(await documentText(page), typedDocument);
+  const alternative = await shortcutSnapshot(page, "BracketRight", "]");
+  assert.notEqual(alternative.ghost, continued);
+  assert.equal(alternative.text, typedDocument);
+  const restored = await shortcutSnapshot(page, "BracketLeft", "[");
+  assert.equal(restored.ghost, continued);
+  assert.equal(restored.text, typedDocument);
+  assert.deepEqual((await feedbackSessions(page)).at(-1).events, []);
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), before.slice(0, -1) + original + "$");
+  const events = (await feedbackSessions(page)).at(-1).events;
+  assert.equal(events.length, 1);
+  assert.equal(events[0].accepted, true);
+  assert.equal(events[0].sameSnapshot, true, "The continued original retains its pre-typing feedback features");
+  assert.equal(events[0].insertText, continued, "Tab only inserts the remaining suffix");
+  await page.keyboard.press(process.platform === "darwin" ? "Meta+z" : "Control+z");
+  assert.equal(await documentText(page), typedDocument);
+  await noGhost(page);
+  assert.equal((await feedbackSessions(page)).at(-1).events.length, 1);
+});
+
+test("dismissing an alternative records only that visible choice", async (t) => {
+  const page = await fixture(t);
+  await observeFeedback(page);
+  const before = await setDocument(page, "$f(x)=x+1$\n$f(x)=x+2$\n$f(x)|$");
+  await ghostText(page);
+  const chosen = (await shortcutSnapshot(page, "BracketRight", "]")).ghost;
+  assert.deepEqual((await feedbackSessions(page)).at(-1).events, []);
+  await page.keyboard.press("Escape");
+  await noGhost(page);
+  assert.equal(await documentText(page), before);
+  const events = (await feedbackSessions(page)).at(-1).events;
+  assert.equal(events.length, 1);
+  assert.equal(events[0].accepted, false);
+  assert.equal(events[0].insertText, chosen);
+});
+
+test("alternative suggestions cannot outlive cursor movement edits or disabled features", async (t) => {
+  const page = await fixture(t);
+  const before = await setDocument(page, "$f(x)=x+1$\n$f(x)=x+2$\n$f(x)|$");
+  await ghostText(page);
+  await shortcutSnapshot(page, "BracketRight", "]");
+  await page.keyboard.press("ArrowLeft");
+  await noGhost(page);
+  assert.equal((await shortcutSnapshot(page, "BracketRight", "]")).ghost, "");
+  assert.equal(await documentText(page), before);
+  await page.keyboard.press("ArrowRight");
+  await shortcutSnapshot(page, "Backslash", "\\");
+  await shortcutSnapshot(page, "BracketRight", "]");
+  await page.keyboard.type("z");
+  await noGhost(page);
+  assert.equal((await shortcutSnapshot(page, "BracketRight", "]")).ghost, "");
+  assert.equal(await documentText(page), before.slice(0, -1) + "z$");
+  await setDocument(page, "$g(x)=x+3$\n$g(x)=x+4$\n$g(x)|$");
+  await ghostText(page);
+  await shortcutSnapshot(page, "BracketRight", "]");
+  await page.evaluate(() => window.fixture.configure({ expressions: false, sequences: false }));
+  await noGhost(page);
+  const blocked = await shortcutSnapshot(page, "BracketRight", "]");
+  assert.equal(blocked.ghost, "");
+  assert.equal(blocked.text, "$g(x)=x+3$\n$g(x)=x+4$\n$g(x)$");
+});
+
 test("auto fractions wrap the typed block and support denominator typing and independent undo", async (t) => {
   const page = await fixture(t);
   await setDocument(page, "$|$");
@@ -709,8 +887,8 @@ test("blur dismisses the preview without changing document content", async (t) =
   assert.equal(await documentText(page), before);
 });
 
-test("popup renders connection state and persists validated preferences", async (t) => {
-  const context = await browser.newContext({ viewport: { width: 370, height: 640 } });
+async function popupFixture(t, initialSettings) {
+  const context = await browser.newContext({ viewport: { width: 320, height: 700 } });
   const page = await context.newPage();
   const errors = [];
   page.on("pageerror", (error) => errors.push(error.message));
@@ -718,8 +896,11 @@ test("popup renders connection state and persists validated preferences", async 
     await context.close();
     assert.deepEqual(errors, [], "The popup should have no uncaught browser errors");
   });
-  await page.addInitScript(() => {
+  await page.addInitScript((initialSettings) => {
     const key = "fixtureChromeStorage";
+    if (initialSettings && !sessionStorage.getItem(key)) {
+      sessionStorage.setItem(key, JSON.stringify({ mathAutocompleteSettings: initialSettings }));
+    }
     const read = () => JSON.parse(sessionStorage.getItem(key) || "{}");
     window.chrome = {
       storage: {
@@ -734,10 +915,15 @@ test("popup renders connection state and persists validated preferences", async 
       },
     };
     window.popupPreferences = () => read().mathAutocompleteSettings;
-  });
+  }, initialSettings);
   await page.goto(`${baseURL}/extension/popup.html`);
   await page.waitForFunction(() => !document.getElementById("enabled").disabled);
   await page.waitForFunction(() => document.getElementById("connection-label").textContent === "Connected to your editor");
+  return page;
+}
+
+test("popup renders connection state and persists validated preferences", async (t) => {
+  const page = await popupFixture(t);
   assert.equal(await page.locator("#sequence-end").inputValue(), "n");
   assert.equal(await page.locator("#autoFractions").isChecked(), true);
   await page.screenshot({ path: path.join(root, "test-results/popup.png"), fullPage: true });
@@ -769,6 +955,81 @@ test("popup renders connection state and persists validated preferences", async 
   assert.equal(await page.locator("#autoFractions").isChecked(), false);
   assert.equal(await page.locator("#sequences").isChecked(), true);
   assert.equal(await page.locator("#sequence-end").inputValue(), "m");
+});
+
+
+test("popup suggestion controls preserve valid preferences and reject invalid prefix lengths", async (t) => {
+  const page = await popupFixture(t);
+  assert.equal(await page.locator("#automaticSuggestions").isChecked(), true);
+  assert.equal(await page.locator("#suggestion-delay").inputValue(), "50");
+  assert.equal(await page.locator("#min-prefix").inputValue(), "3");
+  await page.locator("#automaticSuggestions").uncheck();
+  await page.waitForFunction(() => window.popupPreferences()?.automaticSuggestions === false);
+  assert.equal(await page.locator("#suggestion-delay").isDisabled(), true);
+  assert.equal(await page.locator("#autoFractions").isChecked(), true);
+  await page.locator("#automaticSuggestions").check();
+  await page.locator("#suggestion-delay").selectOption("500");
+  await page.waitForFunction(() => window.popupPreferences()?.debounceMs === 500);
+  await page.locator("#min-prefix").fill("7");
+  await page.waitForFunction(() => window.popupPreferences()?.minPrefix === 7);
+  for (const invalid of ["0", "21", "2.5", ""]) {
+    await page.locator("#min-prefix").fill(invalid);
+    assert.equal(await page.locator("#min-prefix").getAttribute("aria-invalid"), "true", invalid);
+    assert.equal(await page.locator("#prefix-error").isVisible(), true, invalid);
+    assert.equal(await page.evaluate(() => window.popupPreferences().minPrefix), 7, invalid);
+  }
+  await page.locator("#min-prefix").fill("5");
+  await page.waitForFunction(() => window.popupPreferences()?.minPrefix === 5);
+  assert.equal(await page.locator("#prefix-error").isVisible(), false);
+  await page.locator("#expressions").uncheck();
+  await page.waitForFunction(() => window.popupPreferences()?.expressions === false);
+  assert.equal(await page.locator("#min-prefix").isDisabled(), true);
+  await page.reload();
+  await page.waitForFunction(() => !document.getElementById("enabled").disabled);
+  assert.equal(await page.locator("#automaticSuggestions").isChecked(), true);
+  assert.equal(await page.locator("#suggestion-delay").inputValue(), "500");
+  assert.equal(await page.locator("#min-prefix").inputValue(), "5");
+  assert.equal(await page.locator("#min-prefix").isDisabled(), true);
+});
+
+test("popup keeps custom stored delays when changing another setting", async (t) => {
+  const page = await popupFixture(t, { debounceMs: 375, minPrefix: 6, automaticSuggestions: false });
+  assert.equal(await page.locator("#suggestion-delay").inputValue(), "375");
+  assert.equal(await page.locator("#suggestion-delay").isDisabled(), true);
+  assert.equal(await page.locator("#min-prefix").inputValue(), "6");
+  await page.locator("#autoFractions").uncheck();
+  await page.waitForFunction(() => window.popupPreferences()?.autoFractions === false);
+  assert.equal(await page.evaluate(() => window.popupPreferences().debounceMs), 375);
+  assert.equal(await page.evaluate(() => window.popupPreferences().automaticSuggestions), false);
+  await page.reload();
+  await page.waitForFunction(() => !document.getElementById("enabled").disabled);
+  assert.equal(await page.locator("#suggestion-delay").inputValue(), "375");
+});
+
+test("popup follows the system theme and fits its compact width", async (t) => {
+  const page = await popupFixture(t);
+  const backgrounds = [];
+  for (const colorScheme of ["light", "dark"]) {
+    await page.emulateMedia({ colorScheme });
+    const layout = await page.evaluate(() => ({
+      background: getComputedStyle(document.documentElement).backgroundColor,
+      width: document.documentElement.scrollWidth,
+      height: document.body.scrollHeight,
+      controls: [...document.querySelectorAll("input, select")].map((element) => {
+        const rect = element.getBoundingClientRect();
+        return { id: element.id, left: rect.left, right: rect.right };
+      }),
+    }));
+    backgrounds.push(layout.background);
+    assert.ok(layout.width <= 320, colorScheme + " popup must not overflow horizontally");
+    assert.ok(layout.height <= 600, colorScheme + " popup should fit without scrolling");
+    for (const control of layout.controls) {
+      assert.ok(control.left >= 0 && control.right <= 320, colorScheme + " " + control.id);
+    }
+    await page.screenshot({ path: path.join(root, "test-results/popup-" + colorScheme + ".png"), fullPage: true });
+  }
+  assert.notEqual(backgrounds[0], backgrounds[1]);
+  assert.match(await page.locator("body").textContent(), /Option/);
 });
 
 
