@@ -69,7 +69,7 @@
     'Rightarrow|Leftarrow|Leftrightarrow|implies|iff|mid|parallel|ne|neq';
   const SEQUENCE_OPERATOR = '(?:\\\\(?:' + SEQUENCE_OPERATORS + ')(?![A-Za-z])|<=|>=|[,+*=<>;≤≥⊂⊆⊃⊇∪∩×·→←↔-])';
   const SEQUENCE_BASE = '(?:' + ELEMENT_STYLE + '|' + ELEMENT_GROUP + '|' +
-    String.raw`(?:\\(?!(?:` + SEQUENCE_OPERATORS + String.raw`|ldots|cdots|dots)(?![A-Za-z]))(?!` +
+    String.raw`(?:\\(?!(?:` + SEQUENCE_OPERATORS + String.raw`|ldots|cdots|dots|left|right|bigl|bigr|Bigl|Bigr|biggl|biggr|Biggl|Biggr)(?![A-Za-z]))(?!` +
     STYLE_NAMES + String.raw`)[A-Za-z]+(?![A-Za-z])|[A-Za-z0-9]))+`;
   const DOTS = /^(\\(?:l|c)?dots(?![A-Za-z])|\.{3}(?!\.)|…)/;
   const endpointValue = (value) => /^(?:[A-Za-z]|\d+|\\[A-Za-z]+|[A-Za-z]\s*[-+]\s*\d+)$/.test(value);
@@ -141,6 +141,44 @@
     return true;
   }
 
+  const GROUP_PAIRS = { '(': ')', '[': ']', '{': '}', '\\{': '\\}', '\\lbrace': '\\rbrace',
+    '\\langle': '\\rangle', '\\lvert': '\\rvert', '\\lVert': '\\rVert' };
+  const GROUP_TOKEN = /^(?:(\\(?:left|right|bigl|bigr|Bigl|Bigr|biggl|biggr|Biggl|Biggr))(?![A-Za-z])\s*)?(\\(?:lbrace|rbrace|langle|rangle|lvert|rvert|lVert|rVert)(?![A-Za-z])|\\[{}|]|[()[\]{}|.])/;
+
+  function groupToken(text, start) {
+    const match = GROUP_TOKEN.exec(text.slice(start));
+    if (!match || escaped(text, start)) return null;
+    const modifier = match[1] || '', symbol = match[2];
+    const opening = modifier === '\\left' || /l$/.test(modifier) || (!modifier && Object.hasOwn(GROUP_PAIRS, symbol));
+    const closing = modifier === '\\right' || /r$/.test(modifier) || (!modifier && Object.values(GROUP_PAIRS).includes(symbol));
+    if (!opening && !closing) return null;
+    return { start, end: start + match[0].length, opening, modifier, symbol,
+      closer: (modifier === '\\left' ? '\\right' : modifier.replace(/l$/, 'r')) + (GROUP_PAIRS[symbol] || symbol) };
+  }
+
+  function balancedGroup(text, opening) {
+    const stack = [opening];
+    for (let at = opening.end; at < text.length;) {
+      const token = groupToken(text, at);
+      if (token) {
+        if (token.opening) {
+          if (stack.length >= 32) return null;
+          stack.push(token);
+        } else {
+          const top = stack.pop();
+          if (!top || (top.modifier === '\\left' ? token.modifier !== '\\right' :
+              token.symbol !== (GROUP_PAIRS[top.symbol] || top.symbol))) return null;
+          if (!stack.length) return token.end;
+        }
+        at = token.end;
+      } else {
+        const command = /^\\(?:[A-Za-z]+|[^\s])/.exec(text.slice(at));
+        at += command ? command[0].length : 1;
+      }
+    }
+    return null;
+  }
+
   function previousTerms(fragment, includeEndpoints = false, source = fragment) {
     const base = new RegExp(SEQUENCE_BASE, 'y');
     const atoms = [];
@@ -148,30 +186,45 @@
     while (at < fragment.length) {
       base.lastIndex = at;
       const match = base.exec(fragment);
-      if (!match || (at > 0 && !baseStartsAt(fragment, at) && atoms[atoms.length - 1]?.end !== at)) {
+      const opening = !match && groupToken(fragment, at);
+      if ((!match && !opening?.opening) || (at > 0 && !baseStartsAt(fragment, at) && atoms[atoms.length - 1]?.end !== at)) {
         // Never start in the middle of a control word.
         const command = /^\\[A-Za-z]+/.exec(fragment.slice(at));
         at += command ? command[0].length : 1;
         continue;
       }
       const start = at;
-      let end = base.lastIndex, hasScript = false, valid = true, incomplete = false;
+      let end = match ? base.lastIndex : balancedGroup(fragment, opening);
+      // A standalone open group contains the active expression. A function's
+      // unfinished argument, handled below, stays part of its partial term.
+      if (end === null) { at = opening.end; continue; }
+      let valid = true, incomplete = false;
       const scripts = new Set();
       while (true) {
         let next = end;
         while (/\s/.test(fragment[next] || '')) next++;
-        if (!/[_^]/.test(fragment[next] || '')) break;
-        hasScript = true;
-        if (scripts.has(fragment[next])) valid = false;
-        scripts.add(fragment[next]);
-        const argument = scriptArgument(fragment, next + 1);
-        if (!argument) { incomplete = true; break; }
-        end = argument.end;
+        if (/[_^]/.test(fragment[next] || '')) {
+          if (scripts.has(fragment[next])) valid = false;
+          scripts.add(fragment[next]);
+          const argument = scriptArgument(fragment, next + 1);
+          if (!argument) { incomplete = true; break; }
+          end = argument.end;
+        } else if (fragment[next] === "'") {
+          end = next + 1;
+        } else {
+          if (!match) break; // Adjacent standalone groups are separate product factors.
+          const group = groupToken(fragment, next);
+          if (!group?.opening) break;
+          const after = balancedGroup(fragment, group);
+          if (after === null) { incomplete = true; break; }
+          end = after;
+          // Scripts on a function result are distinct from scripts on its name.
+          scripts.clear();
+        }
       }
       if (incomplete) break;
-      if (!hasScript) { at = base.lastIndex; continue; }
       const slots = [];
-      valid = scriptSlots(fragment, base.lastIndex, end, slots) && valid &&
+      valid = scriptSlots(fragment, start, end, slots) && valid &&
         fragment.slice(start, end) === source.slice(start, end);
       const chunks = [];
       let offset = start;
@@ -182,7 +235,7 @@
       chunks.push(fragment.slice(offset, end));
       const value = slots[0]?.value;
       const shared = valid && value && slots.every((slot) => compact(slot.value) === compact(value)) ? value : null;
-      atoms.push({ start, end, chunks, value: shared,
+      atoms.push({ start, end, chunks, value: shared, fixed: valid && !slots.length,
         number: shared !== null && /^\d+$/.test(shared) && Number.isSafeInteger(Number(shared)) ? Number(shared) : null });
       at = end;
     }
@@ -199,11 +252,16 @@
       if (!includeEndpoints && previous && ellipsisBetween(gap)) { endpointEnd = atom.end; continue; }
       // Equal indices make a compound element; a changed index starts the next
       // juxtaposed term. Invalid factors stay present so suffix runs cannot hide them.
-      if (previous && /^[ \t]*$/.test(gap) && atom.value !== null && compact(previous.value || '') === compact(atom.value)) {
+      if (previous && /^[ \t]*$/.test(gap) &&
+          ((atom.fixed && (previous.fixed || previous.value !== null)) ||
+            (previous.fixed && atom.value !== null) ||
+            (atom.value !== null && compact(previous.value || '') === compact(atom.value)))) {
         previous.parts.push({ ...atom, gap });
         previous.end = atom.end;
+        if (previous.fixed && !atom.fixed) { previous.value = atom.value; previous.number = atom.number; }
+        previous.fixed = previous.fixed && atom.fixed;
       } else {
-        terms.push({ parts: [{ ...atom, gap: '' }], start: atom.start, end: atom.end, value: atom.value, number: atom.number });
+        terms.push({ parts: [{ ...atom, gap: '' }], start: atom.start, end: atom.end, value: atom.value, number: atom.number, fixed: atom.fixed });
       }
     }
     return terms;
@@ -331,16 +389,22 @@
   function sequenceSuggestion(parsed, region, text, cursor, settings) {
     const outer = sequenceCompletion(parsed, region, text, cursor, settings);
     if (outer) return outer;
-    // If no outer pattern fits, an unfinished script may itself contain a list
-    // (x^{a_1+a_2|}). Try only its currently open groups, never completed scripts.
+    // If no outer pattern fits, an unfinished argument may itself contain a
+    // list. Try only open groups, never the interiors of completed factors.
     const groups = [];
-    for (let at = region.start; at < cursor; at++) {
-      if (escaped(parsed.clean, at)) continue;
-      if (parsed.clean[at] === '{') groups.push(at);
-      else if (parsed.clean[at] === '}') groups.pop();
+    for (let at = region.start; at < cursor;) {
+      const token = groupToken(parsed.clean, at);
+      if (token) {
+        if (token.opening) groups.push(token);
+        else groups.pop();
+        at = token.end;
+      } else {
+        const command = /^\\(?:[A-Za-z]+|[^\s])/.exec(parsed.clean.slice(at));
+        at += command ? command[0].length : 1;
+      }
     }
-    for (const start of groups.slice(-32).reverse()) {
-      const inner = sequenceCompletion(parsed, { ...region, start }, text, cursor, settings);
+    for (const group of groups.slice(-32).reverse()) {
+      const inner = sequenceCompletion(parsed, { ...region, start: group.start }, text, cursor, settings);
       if (inner) return inner;
     }
     return null;
@@ -359,7 +423,12 @@
       const separator = sequenceSeparator(fragment.slice(previous.end, last.start));
       const typed = fragment.slice(last.start);
       const next = separator && completeTerm(previous.parts, String(previous.number + 1), typed);
-      if (next && next.suffix && typed.includes('_')) { terms.pop(); last = previous; }
+      // Juxtaposition alone cannot establish that an absent constant/macro is
+      // meant to repeat. Require its presence, or an explicit list separator.
+      const missingConstant = separator?.key === '' && last.parts.length < previous.parts.length &&
+        sameParts(last.parts, previous.parts.slice(0, last.parts.length)) &&
+        previous.parts.slice(last.parts.length).some((part) => part.fixed);
+      if (next && next.suffix && typed.includes('_') && !missingConstant) { terms.pop(); last = previous; }
     }
     if (last.number === null) return null;
     let tail = fragment.slice(last.end), partial = '', separator, second = last, runEnd = terms.length - 1;
@@ -427,13 +496,16 @@
       suffix = latexJoin(partial + missingSeparator + endpoint.dots + separator.raw, ending.text);
     }
     const beforeRun = fragment.slice(0, first.start).trimEnd();
-    if (beforeRun.endsWith('\\left\\{')) suffix += '\\right\\}';
-    else if (beforeRun.endsWith('\\{')) suffix += '\\}';
-    else if (beforeRun.endsWith('\\left(')) suffix += '\\right)';
-    else if (beforeRun.endsWith('\\left[')) suffix += '\\right]';
-    else if (beforeRun.endsWith('{')) suffix += '}';
-    else if (beforeRun.endsWith('(')) suffix += ')';
-    else if (beforeRun.endsWith('[')) suffix += ']';
+    for (let at = 0; at < beforeRun.length; at++) {
+      const opening = groupToken(beforeRun, at);
+      if (opening?.opening && opening.end === beforeRun.length) { suffix += opening.closer; break; }
+    }
+    // This API inserts only a suffix. An existing closer can be borrowed at the
+    // end, but cannot be moved from the middle of a function term to its end.
+    // Wait for that closer to be typed instead of inserting a duplicate bracket.
+    const right = text.slice(cursor, cursor + settings.maxSuggestionLength);
+    const rightGroup = groupToken(right, right.length - right.trimStart().length);
+    if (rightGroup && !rightGroup.opening && trimOverlap(suffix, right) === suffix) return null;
     return finish(suffix, 'sequence', 'Complete indexed sequence', text, cursor, settings, {
       endpointSource: endpoint.source, position: endpoint.position,
       itemTier: endpoint.position == null ? 0 : Context.scopeTier(parsed, cursor, endpoint.position),
@@ -545,10 +617,12 @@
     return candidate;
   }
 
-  // The offline evaluator uses this same selection policy. Low corpus confidence
-  // must not disable a concrete completion already supported by the document.
+  // The offline evaluator uses this same selection policy. A verified indexed
+  // pattern is a structural completion, not a hypothesis for the token ranker.
   function selectCandidates(ranked, threshold = 0, useLearnedRanking = false) {
     if (!Array.isArray(ranked) || !ranked.length) return [];
+    const sequence = ranked.find((candidate) => candidate.kind === 'sequence');
+    if (sequence) return [sequence];
     const tier = (candidate) => candidate.itemTier ?? candidate.scopeTier ?? 0;
     const isReliable = (candidate) => candidate.reliable ||
       candidate.kind === 'expression' || candidate.kind === 'sequence';
@@ -559,7 +633,7 @@
     const bestTier = Math.max(...eligible.map(tier));
     const scoped = eligible.filter((candidate) => tier(candidate) === bestTier);
     if (useLearnedRanking) {
-      // All providers participate in learned ranking. Document-supported candidates
+      // Ordinary autocomplete providers participate in learned ranking. Document-supported candidates
       // remain eligible below the generated threshold, preserving a useful fallback.
       scoped.sort((a, b) => (b.score || 0) - (a.score || 0) ||
         (b.semanticScore || 0) - (a.semanticScore || 0) ||
@@ -837,7 +911,7 @@
       return cachedParse;
     }
 
-    function collectCandidates(documentText, cursor, overrides) {
+    function requestContext(documentText, cursor, overrides) {
       if (typeof documentText !== 'string' || !Number.isInteger(cursor) || cursor < 0 || cursor > documentText.length) return null;
       const settings = Object.assign({}, DEFAULT_SETTINGS, initialSettings, overrides);
       if (!settings.enabled) return null;
@@ -846,21 +920,43 @@
       const parsed = parse(documentText);
       const active = Context.contextAt(parsed, cursor);
       if (!active) return null;
+      return { settings, parsed, active };
+    }
+
+    function sequenceFromRequest(request, documentText, cursor) {
+      if (!request?.settings.sequences) return null;
+      const { parsed, active, settings } = request;
+      const sequence = sequenceSuggestion(parsed, active.region, documentText, cursor, settings);
+      return sequence ? { ...sequence, structural: true, reliable: true, scopeTier: sequence.itemTier } : null;
+    }
+
+    function suggestSequence(documentText, cursor, overrides) {
+      return sequenceFromRequest(requestContext(documentText, cursor, overrides), documentText, cursor);
+    }
+
+    function collectCandidates(documentText, cursor, overrides) {
+      const request = requestContext(documentText, cursor, overrides);
+      if (!request) return null;
+      const { settings, parsed, active } = request;
       const { region, itemId, ancestorIds } = active;
       const before = parsed.clean.slice(Math.max(region.start, cursor - settings.maxSuggestionLength), cursor);
       const prefix = before.split(/\\\\|\r?\n/).pop();
+      const context = { prefix, right: parsed.clean.slice(cursor, Math.min(region.end, cursor + settings.maxSuggestionLength)),
+        segments: [], itemId, ancestorIds, cursor, maxTokens: 12, maxCandidates: 32 };
+      const sequence = sequenceFromRequest(request, documentText, cursor);
+      if (sequence) {
+        // The repeated syntax establishes the completion. Classifier heuristics,
+        // corpus probabilities, feedback, and unrelated formula matches must
+        // neither reject it nor replace it with a predicted token continuation.
+        return { candidates: [sequence], context };
+      }
       const segments = parsed.segments.filter((segment) => !(segment.start <= cursor && cursor <= segment.end))
         .sort((a, b) => Context.scopeTier(parsed, cursor, b.start) - Context.scopeTier(parsed, cursor, a.start) ||
           Math.abs(a.start - cursor) - Math.abs(b.start - cursor)).slice(0, 128);
-      const context = { prefix, right: parsed.clean.slice(cursor, Math.min(region.end, cursor + settings.maxSuggestionLength)),
-        segments, itemId, ancestorIds, cursor, maxTokens: 12, maxCandidates: 32,
-        declarations: declarationContext(parsed, active, cursor) };
+      context.segments = segments;
+      context.declarations = declarationContext(parsed, active, cursor);
       context.classification = Classifier.analyze(context);
       const candidates = [];
-      if (settings.sequences) {
-        const sequence = sequenceSuggestion(parsed, region, documentText, cursor, settings);
-        if (sequence) candidates.push(sequence);
-      }
       if (settings.expressions) {
         candidates.push(...indexSuggestions(context, parsed, documentText, cursor, settings));
         candidates.push(...expressionSuggestions(parsed, region, documentText, cursor, settings, context));
@@ -898,10 +994,15 @@
       return { candidates: predictor.prepareCandidates([...unique.values()].sort((a, b) => b.itemTier - a.itemTier).slice(0, 32), context), context };
     }
 
+    function rankCandidates(candidates, context) {
+      const sequence = candidates?.find((candidate) => candidate.kind === 'sequence');
+      return sequence ? [sequence] : predictor.rank(candidates, context);
+    }
+
     function suggestAlternatives(documentText, cursor, overrides, limit = 5) {
       const collected = collectCandidates(documentText, cursor, overrides);
       if (!collected?.candidates.length) return [];
-      const ranked = predictor.rank(collected.candidates, collected.context);
+      const ranked = rankCandidates(collected.candidates, collected.context);
       const threshold = predictor.trained && Number.isFinite(artifact?.training?.recommendedThreshold)
         ? Math.max(0, Math.min(1, artifact.training.recommendedThreshold)) : 0;
       const count = Number.isInteger(limit) ? Math.max(1, Math.min(5, limit)) : 5;
@@ -912,7 +1013,8 @@
 
     return {
       collectCandidates,
-      rankCandidates(candidates, context) { return predictor.rank(candidates, context); },
+      suggestSequence,
+      rankCandidates,
       suggestAlternatives,
       suggest(documentText, cursor, overrides) {
         return suggestAlternatives(documentText, cursor, overrides, 1)[0] || null;
@@ -924,7 +1026,7 @@
         return typeof documentText === 'string' ? fractionEdit(parse(documentText), cursor) : null;
       },
       setModel(nextArtifact) { artifact = nextArtifact; predictor = Predictor.createPredictor(artifact); return predictor.valid; },
-      feedback(candidate, accepted) { return predictor.feedback(candidate, accepted); },
+      feedback(candidate, accepted) { return candidate?.kind === 'sequence' ? false : predictor.feedback(candidate, accepted); },
       calibrationState() { return predictor.calibrationState(); },
       reset() { cachedText = undefined; cachedParse = undefined; predictor.reset(); }
     };

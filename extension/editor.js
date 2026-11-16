@@ -52,6 +52,7 @@
   function createExtension(CM) {
     const { StateEffect, StateField, Decoration, EditorView, ViewPlugin, WidgetType, isolateHistory } = CM;
     const setSuggestion = StateEffect.define();
+    const sequenceEngine = Symbol("sequence engine");
 
     // Preserve a visible completion in the same transaction as matching typing.
     // Whitespace between math tokens may differ, but TeX command boundaries must
@@ -122,6 +123,18 @@
       return { ...value, doc: transaction.newDoc, pos: position, fullText, insertText };
     }
 
+    function preferStructuralSequence(value, transaction) {
+      if (!value || value.kind === "sequence" || !settings.enabled || !settings.sequences ||
+          transaction.state.readOnly || !transaction.state.facet(EditorView.editable)) return value;
+      const engine = value[sequenceEngine];
+      if (typeof engine?.suggestSequence !== "function") return value;
+      // Matching an ordinary preview can establish a list midway through typing.
+      // Recheck only the structural rule, in this same transaction, so a stale
+      // predicted tail cannot hide that list. Never rerank tokens or add feedback.
+      const sequence = engine.suggestSequence(transaction.newDoc.toString(), value.pos, settings);
+      return sequence ? { ...sequence, [sequenceEngine]: engine, doc: transaction.newDoc, pos: value.pos } : value;
+    }
+
     class Ghost extends WidgetType {
       constructor(text) { super(); this.text = text; }
       eq(other) { return this.text === other.text; }
@@ -144,7 +157,9 @@
       create: () => null,
       update(value, transaction) {
         if (transaction.reconfigured) value = null;
-        else if (transaction.docChanged || transaction.selection) value = continueSuggestion(value, transaction);
+        else if (transaction.docChanged || transaction.selection) {
+          value = preferStructuralSequence(continueSuggestion(value, transaction), transaction);
+        }
         for (const effect of transaction.effects) {
           if (effect.is(setSuggestion)) value = effect.value;
         }
@@ -225,7 +240,9 @@
         this.cancelTimer();
         this.alternatives = null;
         const result = this.engine.suggest(document.toString(), position, settings);
-        this.view.dispatch({ effects: setSuggestion.of(result ? { ...result, doc: document, pos: position } : null) });
+        this.view.dispatch({ effects: setSuggestion.of(result ? {
+          ...result, [sequenceEngine]: this.engine, doc: document, pos: position,
+        } : null) });
         return true;
       }
 
@@ -257,7 +274,9 @@
         }
         alternatives.index = (alternatives.index + direction + alternatives.choices.length) % alternatives.choices.length;
         const chosen = alternatives.choices[alternatives.index];
-        this.view.dispatch({ effects: setSuggestion.of({ ...chosen, doc: current.doc, pos: current.pos }) });
+        this.view.dispatch({ effects: setSuggestion.of({
+          ...chosen, [sequenceEngine]: this.engine, doc: current.doc, pos: current.pos,
+        }) });
         return true;
       }
 

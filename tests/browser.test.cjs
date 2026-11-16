@@ -679,6 +679,89 @@ test("product lists finish a partial second term and a partial synchronized endp
   await noGhost(page);
 });
 
+test("structural function lists complete the whole repeated term with the installed model", async (t) => {
+  const page = await fixture(t, { bundledModel: true });
+  for (const [input, completion] of [
+    ["r_1f(x_1)+r_2f(x_2)", "+\\cdots+r_nf(x_n)"],
+    ["r_1f(x_1)+r_2f(x_2)+...", "+r_nf(x_n)"],
+  ]) {
+    const before = "$" + input + "$";
+    if (input.endsWith("...")) await setDocument(page, "$" + input + "|$");
+    else {
+      await setDocument(page, "$|$");
+      await page.keyboard.type(input, { delay: 40 });
+    }
+    assert.equal(await ghostText(page), completion);
+    assert.equal(await documentText(page), before);
+    assert.equal((await shortcutSnapshot(page, "BracketRight", "]")).ghost, completion,
+      "Token predictions must not compete with a recognized structural list");
+    await page.keyboard.press("Tab");
+    assert.equal(await documentText(page), "$" + input + completion + "$");
+    await noGhost(page);
+    await page.keyboard.press(process.platform === "darwin" ? "Meta+z" : "Control+z");
+    assert.equal(await documentText(page), before);
+    await noGhost(page);
+  }
+});
+
+test("structural function lists complete partial terms and endpoints with paired closers", async (t) => {
+  const page = await fixture(t, { bundledModel: true });
+  for (const [input, completion, completed] of [
+    ["$r_1f(x_1)+r_2f(x_|)$", "2)+\\cdots+r_nf(x_n", "$r_1f(x_1)+r_2f(x_2)+\\cdots+r_nf(x_n)$"],
+    ["$r_1f(x_1)+r_2f(x_2)+...+r_nf(x_|)$", "n", "$r_1f(x_1)+r_2f(x_2)+...+r_nf(x_n)$"],
+    ["$r_1f(x_1)+r_2f(x_2)+...+r_mf(x_{|})$", "m", "$r_1f(x_1)+r_2f(x_2)+...+r_mf(x_{m})$"],
+  ]) {
+    await setDocument(page, input);
+    assert.equal(await ghostText(page), completion, input);
+    await page.keyboard.press("Tab");
+    assert.equal(await documentText(page), completed, input);
+    await noGhost(page);
+  }
+});
+
+test("structural function lists use matching document endpoints without changing the typed ellipsis", async (t) => {
+  const page = await fixture(t, { bundledModel: true });
+  const prior = "$r_1f(x_1)+r_2f(x_2)+\\cdots+r_Mf(x_M)$\n";
+  await setDocument(page, prior + "$r_1f(x_1)+r_2f(x_2)+...|$");
+  assert.equal(await ghostText(page), "+r_Mf(x_M)");
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), prior + "$r_1f(x_1)+r_2f(x_2)+...+r_Mf(x_M)$");
+  await noGhost(page);
+});
+
+test("structural function lists replace a continued ordinary preview once the pattern is clear", async (t) => {
+  const page = await fixture(t);
+  const prior = "$r_1f(x_1)+r_2f(x_2)+q$\n";
+  await setDocument(page, prior + "$r_1f(x_1)+|$");
+  assert.equal(await ghostText(page), "r_2f(x_2)+q");
+  await page.keyboard.type("r_2f(x_2)");
+  assert.equal(await ghostText(page), "+\\cdots+r_nf(x_n)");
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), prior + "$r_1f(x_1)+r_2f(x_2)+\\cdots+r_nf(x_n)$");
+  await noGhost(page);
+});
+
+test("structural function lists remain independent of expression settings and learned feedback", async (t) => {
+  const page = await fixture(t, { bundledModel: true });
+  await observeFeedback(page);
+  await page.evaluate(() => window.fixture.configure({ expressions: false, minPrefix: 20 }));
+  for (const action of ["Tab", "Escape"]) {
+    await setDocument(page, "$r_1f(x_1)+r_2f(x_2)|$");
+    assert.equal(await ghostText(page), "+\\cdots+r_nf(x_n)");
+    await page.keyboard.press(action);
+    await noGhost(page);
+    const session = (await feedbackSessions(page)).at(-1);
+    assert.equal(session.state.updates, 0, action + " on a structural list must not recalibrate token prediction");
+    assert.ok(session.events.every((event) => event.result === false));
+  }
+  await page.evaluate(() => window.fixture.configure({ sequences: false }));
+  await setDocument(page, "$r_1f(x_1)+r_2f(x_2)|$");
+  await noGhost(page);
+  await page.evaluate(() => window.fixture.configure({ expressions: true, minPrefix: 3 }));
+  await setDocument(page, "$f(x)=x+1$\n$f(x)|$");
+  assert.ok((await ghostText(page)).trim());
+});
+
 test("indexed chains preserve sum product and relation separators on acceptance", async (t) => {
   const page = await fixture(t);
   for (const [input, completion] of [
