@@ -762,6 +762,101 @@ test("structural function lists remain independent of expression settings and le
   assert.ok((await ghostText(page)).trim());
 });
 
+test("fixed-index lists preserve unchanged arguments while typing with the installed model", async (t) => {
+  const page = await fixture(t, { bundledModel: true });
+  await observeFeedback(page);
+  await page.evaluate(() => window.fixture.configure({ expressions: false }));
+  await setDocument(page, "$|$");
+  const input = "r_1f(x_1,y_j)+r_2f(x_2,y_j)";
+  await page.keyboard.type(input, { delay: 40 });
+  const before = "$" + input + "$";
+  assert.equal(await ghostText(page), "+\\cdots+r_nf(x_n,y_j)");
+  assert.equal(await documentText(page), before);
+  assert.equal((await shortcutSnapshot(page, "BracketRight", "]")).ghost, "+\\cdots+r_nf(x_n,y_j)");
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), "$" + input + "+\\cdots+r_nf(x_n,y_j)$");
+  await noGhost(page);
+  assert.equal((await feedbackSessions(page)).at(-1).state.updates, 0);
+  await page.keyboard.press(process.platform === "darwin" ? "Meta+z" : "Control+z");
+  assert.equal(await documentText(page), before);
+  await noGhost(page);
+});
+
+test("fixed-index lists complete partial terms, implicit products and fixed endpoint slots", async (t) => {
+  const page = await fixture(t, { bundledModel: true });
+  for (const [input, completion, completed] of [
+    ["$r_1f(x_1,y_j)+r_2f(x_|)$", "2,y_j)+\\cdots+r_nf(x_n,y_j", "$r_1f(x_1,y_j)+r_2f(x_2,y_j)+\\cdots+r_nf(x_n,y_j)$"],
+    ["$r_1f(x_1,y_j)+r_2f(x_2,y_j)+...|$", "+r_nf(x_n,y_j)", "$r_1f(x_1,y_j)+r_2f(x_2,y_j)+...+r_nf(x_n,y_j)$"],
+    ["$r_1f(x_1,y_j)+r_2f(x_2,y_j)+...+r_mf(x_m,y_|)$", "j", "$r_1f(x_1,y_j)+r_2f(x_2,y_j)+...+r_mf(x_m,y_j)$"],
+    ["$a_7b_1+a_7b_|$", "2+\\cdots+a_7b_n", "$a_7b_1+a_7b_2+\\cdots+a_7b_n$"],
+    ["$r_7f(x_1,y_7)+r_7f(x_|)$", "2,y_7)+\\cdots+r_7f(x_n,y_7", "$r_7f(x_1,y_7)+r_7f(x_2,y_7)+\\cdots+r_7f(x_n,y_7)$"],
+    ["$a_1a_2 a_2a_2|$", " \\cdots a_na_2", "$a_1a_2 a_2a_2 \\cdots a_na_2$"],
+  ]) {
+    await setDocument(page, input);
+    assert.equal(await ghostText(page), completion, input);
+    await page.keyboard.press("Tab");
+    assert.equal(await documentText(page), completed, input);
+    await noGhost(page);
+  }
+});
+
+test("fixed-index lists distinguish fixed numbers from the linked changing indices", async (t) => {
+  const page = await fixture(t, { bundledModel: true });
+  for (const fixed of ["7", "1"]) {
+    const input = "r_1f(x_1,y_" + fixed + ")+r_2f(x_2,y_" + fixed + ")+...";
+    await setDocument(page, "$" + input + "|$");
+    const completion = "+r_nf(x_n,y_" + fixed + ")";
+    assert.equal(await ghostText(page), completion);
+    await page.keyboard.press("Tab");
+    assert.equal(await documentText(page), "$" + input + completion + "$");
+    await noGhost(page);
+  }
+});
+
+test("list final-index hierarchy avoids occupied variables and falls back to n when exhausted", async (t) => {
+  const page = await fixture(t, { bundledModel: true });
+  for (const [prefix, finalIndex] of [["", "k"], ["k=", "j"], ["k+j=", "i"], ["k+j+i=", "n"]]) {
+    const input = prefix + "a_1n_1+a_2n_2+...";
+    await setDocument(page, "$" + input + "|$");
+    const completion = "+a_" + finalIndex + "n_" + finalIndex;
+    assert.equal(await ghostText(page), completion, input);
+    await page.keyboard.press("Tab");
+    assert.equal(await documentText(page), "$" + input + completion + "$", input);
+    await noGhost(page);
+  }
+});
+
+test("list final-index hierarchy reads both sides of this equation and ignores command names and other equations", async (t) => {
+  const page = await fixture(t);
+  await setDocument(page, "$a_1n_1+a_2n_2+...|=k$");
+  assert.equal(await ghostText(page), "+a_jn_j");
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), "$a_1n_1+a_2n_2+...+a_jn_j=k$");
+  await noGhost(page);
+  const prior = "$n+k+j+i$ Prose n k j i\n";
+  await setDocument(page, prior + "$\\sin(0)=a_1+a_2+...|$");
+  assert.equal(await ghostText(page), "+a_n");
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), prior + "$\\sin(0)=a_1+a_2+...+a_n$");
+  await noGhost(page);
+});
+
+test("list final-index hierarchy retains stronger document and explicit endpoint choices", async (t) => {
+  const page = await fixture(t);
+  const prior = "$r_1f(x_1,y_j)+r_2f(x_2,y_j)+\\cdots+r_Mf(x_M,y_j)$\n";
+  await setDocument(page, prior + "$r_1f(x_1,y_j)+r_2f(x_2,y_j)+...|$");
+  assert.equal(await ghostText(page), "+r_Mf(x_M,y_j)");
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), prior + "$r_1f(x_1,y_j)+r_2f(x_2,y_j)+...+r_Mf(x_M,y_j)$");
+  await noGhost(page);
+  await page.evaluate(() => window.fixture.configure({ sequenceEnd: "m" }));
+  await setDocument(page, "$a_1n_1+a_2n_2+...|$");
+  assert.equal(await ghostText(page), "+a_mn_m");
+  await page.keyboard.press("Tab");
+  assert.equal(await documentText(page), "$a_1n_1+a_2n_2+...+a_mn_m$");
+  await noGhost(page);
+});
+
 test("indexed chains preserve sum product and relation separators on acceptance", async (t) => {
   const page = await fixture(t);
   for (const [input, completion] of [

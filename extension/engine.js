@@ -229,40 +229,68 @@
       const chunks = [];
       let offset = start;
       for (const slot of slots) {
-        chunks.push(fragment.slice(offset, slot.start), { value: slot.value, braced: slot.braced });
+        chunks.push(fragment.slice(offset, slot.start), { value: slot.value, braced: slot.braced,
+          raw: fragment.slice(slot.start, slot.end) });
         offset = slot.end;
       }
       chunks.push(fragment.slice(offset, end));
-      const value = slots[0]?.value;
-      const shared = valid && value && slots.every((slot) => compact(slot.value) === compact(value)) ? value : null;
-      atoms.push({ start, end, chunks, value: shared, fixed: valid && !slots.length,
-        number: shared !== null && /^\d+$/.test(shared) && Number.isSafeInteger(Number(shared)) ? Number(shared) : null });
+      atoms.push({ start, end, chunks, valid, fixed: valid && !slots.length });
       at = end;
     }
-    const terms = [];
-    let endpointEnd = null;
+    const blocks = [];
     for (const atom of atoms) {
-      if (endpointEnd !== null && /^[ \t]*$/.test(source.slice(endpointEnd, atom.start))) {
-        endpointEnd = atom.end;
-        continue;
-      }
-      endpointEnd = null;
+      const block = blocks[blocks.length - 1];
+      const gap = block ? source.slice(block[block.length - 1].end, atom.start) : '';
+      if (block && /^[ \t]*$/.test(gap)) block.push({ ...atom, gap });
+      else blocks.push([{ ...atom, gap: '' }]);
+    }
+    const terms = [];
+    const term = (parts) => ({ start: parts[0].start, end: parts[parts.length - 1].end,
+      parts: parts.map((part, i) => ({ ...part, gap: i ? part.gap : '' })) });
+    for (let blockIndex = 0; blockIndex < blocks.length; blockIndex++) {
+      const block = blocks[blockIndex];
       const previous = terms[terms.length - 1];
-      const gap = previous ? source.slice(previous.end, atom.start) : '';
-      if (!includeEndpoints && previous && ellipsisBetween(gap)) { endpointEnd = atom.end; continue; }
-      // Equal indices make a compound element; a changed index starts the next
-      // juxtaposed term. Invalid factors stay present so suffix runs cannot hide them.
-      if (previous && /^[ \t]*$/.test(gap) &&
-          ((atom.fixed && (previous.fixed || previous.value !== null)) ||
-            (previous.fixed && atom.value !== null) ||
-            (atom.value !== null && compact(previous.value || '') === compact(atom.value)))) {
-        previous.parts.push({ ...atom, gap });
-        previous.end = atom.end;
-        if (previous.fixed && !atom.fixed) { previous.value = atom.value; previous.number = atom.number; }
-        previous.fixed = previous.fixed && atom.fixed;
-      } else {
-        terms.push({ parts: [{ ...atom, gap: '' }], start: atom.start, end: atom.end, value: atom.value, number: atom.number, fixed: atom.fixed });
+      if (!includeEndpoints && previous && ellipsisBetween(source.slice(previous.end, block[0].start))) continue;
+      // Explicit operators delimit whole compound terms. Within a juxtaposed
+      // product, split only when a repeated factor shape also advances an index.
+      // This keeps a fixed b_7 attached in a_1b_7+a_2b_7, while recognizing
+      // implicit products such as a_jb_1 a_jb_2. The final repeat may be partial.
+      let width = block.length;
+      let partialBoundary = block.length;
+      const before = blocks[blockIndex - 1], after = blocks[blockIndex + 1];
+      const preceding = before && sequenceSeparator(source.slice(before[before.length - 1].end, block[0].start));
+      const following = after && sequenceSeparator(source.slice(block[block.length - 1].end, after[0].start));
+      const trailing = !after && new RegExp('^\\s*(' + SEQUENCE_OPERATOR + ')').exec(source.slice(block[block.length - 1].end));
+      const explicit = [preceding?.key, following?.key, trailing?.[1]].some((key) => key && key !== '=') ||
+        (preceding?.key === '=' && inferPattern(before, block)) || (following?.key === '=' && inferPattern(block, after));
+      if (!explicit) for (let size = 1; size < block.length && size <= 32; size++) {
+        const count = Math.min(size, block.length - size);
+        const first = block.slice(0, size), second = block.slice(size, size + count);
+        const typed = source.slice(second[0].start);
+        // A wider complete pattern may explain a failed narrower partition.
+        // A partial repeat cannot absorb an already inconsistent run into its
+        // first term, so it must begin no later than that run's first mismatch.
+        const reference = count < size && size <= partialBoundary &&
+          sameParts(first.slice(0, count), second) && provisionalPattern(first, typed);
+        const partial = reference && completeTerm(reference.parts, String(reference.secondNumber + 1), typed);
+        const pattern = count === size && inferPattern(first, second);
+        let matches = !!pattern;
+        if (pattern) for (let start = size; start < block.length; start += size) {
+          const current = block.slice(start, start + size);
+          const expected = pattern.firstNumber + start / size;
+          const valid = current.length === size ? numberIndex(patternValue(current, pattern.parts) || '') === expected :
+            !!completeTerm(pattern.parts, String(expected), source.slice(current[0].start));
+          if (!valid) { partialBoundary = Math.min(partialBoundary, start); matches = false; break; }
+        }
+        if (matches || partial?.suffix) { width = size; break; }
       }
+      // Retain a broken run as invalid evidence. Otherwise the entire block
+      // could be mistaken for one giant first term when its trailing index
+      // is unfinished, bypassing the partition checks above.
+      if (width === block.length && partialBoundary < block.length) {
+        for (const part of block) part.valid = false;
+      }
+      for (let start = 0; start < block.length; start += width) terms.push(term(block.slice(start, start + width)));
     }
     return terms;
   }
@@ -273,6 +301,63 @@
       return part.chunks.length === chunks.length && part.chunks.every((chunk, i) =>
         typeof chunk === 'string' ? typeof chunks[i] === 'string' && compact(chunk) === compact(chunks[i]) : typeof chunks[i] === 'object');
     });
+  }
+
+  function indexSlots(parts) {
+    return parts.flatMap((part) => part.chunks.filter((chunk) => typeof chunk === 'object'));
+  }
+
+  function numberIndex(value) {
+    return /^\d+$/.test(value) && Number.isSafeInteger(Number(value)) ? Number(value) : null;
+  }
+
+  function inferPattern(first, second) {
+    if (!sameParts(first, second) || [...first, ...second].some((part) => !part.valid)) return null;
+    const before = indexSlots(first), after = indexSlots(second);
+    let firstNumber = null, secondNumber = null;
+    const varying = [];
+    for (let i = 0; i < before.length; i++) {
+      const changes = compact(before[i].value) !== compact(after[i].value);
+      varying.push(changes);
+      if (!changes) continue;
+      const a = numberIndex(before[i].value), b = numberIndex(after[i].value);
+      if (a === null || b !== a + 1 || (firstNumber !== null && (a !== firstNumber || b !== secondNumber))) return null;
+      firstNumber = a; secondNumber = b;
+    }
+    if (firstNumber === null) return null;
+    let slot = 0;
+    const parts = second.map((part) => ({ ...part, chunks: part.chunks.map((chunk) =>
+      typeof chunk === 'string' ? chunk : { ...chunk, varying: varying[slot++] }) }));
+    return { parts, firstNumber, secondNumber };
+  }
+
+  function patternValue(parts, template) {
+    if (!sameParts(parts, template) || parts.some((part) => !part.valid)) return null;
+    const values = indexSlots(parts), expected = indexSlots(template);
+    let value = null;
+    for (let i = 0; i < values.length; i++) {
+      if (!expected[i].varying) {
+        if (compact(values[i].value) !== compact(expected[i].value)) return null;
+      } else if (value === null) value = values[i].value;
+      else if (compact(value) !== compact(values[i].value)) return null;
+    }
+    return value;
+  }
+
+  function provisionalPattern(parts, typed = '') {
+    if (parts.some((part) => !part.valid)) return null;
+    const counts = new Map();
+    for (const slot of indexSlots(parts)) {
+      const number = numberIndex(slot.value);
+      if (number !== null) counts.set(number, (counts.get(number) || 0) + 1);
+    }
+    for (const [number] of [...counts].sort((a, b) => b[1] - a[1])) {
+      const pattern = { secondNumber: number, parts: parts.map((part) => ({ ...part,
+        chunks: part.chunks.map((chunk) => typeof chunk === 'string' ? chunk :
+          { ...chunk, varying: numberIndex(chunk.value) === number }) })) };
+      if (!typed || completeTerm(pattern.parts, String(number + 1), typed)) return pattern;
+    }
+    return null;
   }
 
   function latexJoin(left, right) {
@@ -290,7 +375,8 @@
         const normalized = compact(text);
         const braced = needle.startsWith(normalized) && needle.length > normalized.length ? needle[normalized.length] === '{' : chunk.braced;
         chunks.push({ ...chunk, braced });
-        text += indexText(value, braced);
+        text += chunk.varying === false && braced === chunk.braced && chunk.raw
+          ? chunk.raw : indexText(chunk.varying === false ? chunk.value : value, braced);
       }
       renderedParts.push({ ...part, chunks });
     }
@@ -302,6 +388,19 @@
 
   function indexText(value, braced) {
     return braced || !/^(?:[A-Za-z]|\d)$/.test(value) ? '{' + value + '}' : value;
+  }
+
+  function availableSequenceEnd(parsed, cursor) {
+    const region = parsed.regions.find((part) => part.start <= cursor && cursor <= part.end);
+    if (!region) return 'n';
+    // Use this equation on both sides of the cursor. Context.clean already
+    // masks comments and text; control-word names are not mathematical letters.
+    // Keep style-command arguments, since \mathbf{n} still uses the variable n.
+    const math = parsed.clean.slice(region.start, region.end)
+      .replace(/\\(?:begin|end)\s*\{[^{}]*\}/g, ' ')
+      .replace(/\\(?:[A-Za-z]+|[^\s])/g, ' ');
+    const used = new Set(math.match(/[nkji]/g) || []);
+    return ['n', 'k', 'j', 'i'].find((symbol) => !used.has(symbol)) || 'n';
   }
 
   function inferEndpoint(parsed, parts, firstNumber, cursor, settings, separator) {
@@ -324,8 +423,10 @@
     for (const region of regions) {
       for (let i = 0; i + 2 < region.terms.length; i++) {
         const [first, second, last] = region.terms.slice(i, i + 3);
-        if (first.number === null || second.number !== first.number + 1 || !last.value || !endpointValue(last.value) ||
-            ![first, second, last].every((term) => sameParts(term.parts, parts))) continue;
+        const firstValue = numberIndex(patternValue(first.parts, parts) || '');
+        const secondValue = numberIndex(patternValue(second.parts, parts) || '');
+        const finalValue = patternValue(last.parts, parts);
+        if (firstValue === null || secondValue !== firstValue + 1 || !finalValue || !endpointValue(finalValue)) continue;
         const between = sequenceSeparator(region.body.slice(first.end, second.start));
         const dots = ellipsisBetween(region.body.slice(second.end, last.start));
         if (!between || between.key !== separator.key || !dots || dots.key !== separator.key) continue;
@@ -335,8 +436,9 @@
         while (runStart > 0) {
           const earlier = region.terms[runStart - 1], current = region.terms[runStart];
           const before = sequenceSeparator(region.body.slice(earlier.end, current.start));
-          if (before?.key !== separator.key || earlier.number === null ||
-              earlier.number + 1 !== current.number || !sameParts(earlier.parts, parts)) break;
+          const number = numberIndex(patternValue(earlier.parts, parts) || '');
+          const currentNumber = numberIndex(patternValue(current.parts, parts) || '');
+          if (before?.key !== separator.key || number === null || number + 1 !== currentNumber) break;
           runStart--;
         }
         const earlier = region.terms[runStart - 1];
@@ -349,8 +451,8 @@
         if (following && sequenceSeparator(region.body.slice(last.end, following.start))?.key === '') continue;
         const position = region.start + region.terms[runStart].start;
         if (position <= cursor && region.start + last.end >= cursor) continue;
-        const score = Math.abs(cursor - position) + (region.terms[runStart].number === firstNumber ? 0 : 10000);
-        if (!best || score < best.score) best = { value: last.value, dots: dots.dots, score, source: 'previous-list', position };
+        const score = Math.abs(cursor - position) + (numberIndex(patternValue(region.terms[runStart].parts, parts) || '') === firstNumber ? 0 : 10000);
+        if (!best || score < best.score) best = { value: finalValue, dots: dots.dots, score, source: 'previous-list', position };
       }
     }
     if (best) return best;
@@ -361,8 +463,8 @@
         if ((before && sequenceSeparator(region.body.slice(before.end, term.start))?.key === '') ||
             (after && sequenceSeparator(region.body.slice(term.end, after.start))?.key === '') ||
             /[A-Za-z0-9_]/.test(region.body[term.end] || '')) continue;
-        if (!sameParts(term.parts, parts) || !/^[ijk]$/.test(term.value || '')) continue;
-        const symbol = term.value;
+        const symbol = patternValue(term.parts, parts);
+        if (!/^[ijk]$/.test(symbol || '')) continue;
         const endpointPattern = String.raw`([A-Za-z](?:\s*[-+]\s*\d+)?|\d+|\\[A-Za-z]+)(?![A-Za-z0-9])`;
         const boundPatterns = [
           String.raw`(?:0|1)\s*\\le(?:q)?\s*` + symbol + String.raw`\s*\\le(?:q)?\s*`,
@@ -382,8 +484,9 @@
       ? String(settings.sequenceEnd).trim() : '';
     const explicitInteger = /^\d{1,3}$/.test(configured) && Number(configured) >= 3 && Number(configured) <= 999;
     const explicitSymbol = /^(?:[A-Za-z]|\\[A-Za-z]+|[A-Za-z]\s*[-+]\s*\d+)$/.test(configured);
-    const value = explicitInteger ? String(Number(configured)) : explicitSymbol ? configured : 'n';
-    return { value, dots: separator.key === ',' ? '\\ldots' : '\\cdots', source: value === 'n' ? 'default' : 'configured' };
+    const isConfigured = explicitInteger || (explicitSymbol && configured !== 'n');
+    const value = isConfigured ? (explicitInteger ? String(Number(configured)) : configured) : availableSequenceEnd(parsed, cursor);
+    return { value, dots: separator.key === ',' ? '\\ldots' : '\\cdots', source: isConfigured ? 'configured' : 'default' };
   }
 
   function sequenceSuggestion(parsed, region, text, cursor, settings) {
@@ -416,48 +519,60 @@
     const terms = previousTerms(parsed.clean.slice(fragmentStart, cursor), false, fragment);
     if (!terms.length) return null;
     let last = terms[terms.length - 1];
-    // A partial factor or product is rendered from the previous complete term.
-    // This also covers an unfinished nested exponent p_2^{k_.
-    const previous = terms[terms.length - 2];
-    if (previous && previous.number !== null) {
+    let previous = terms[terms.length - 2];
+    let pattern = previous && inferPattern(previous.parts, last.parts);
+    // Prefer a complete pair: it proves which slots vary and which stay fixed.
+    // When the second term is unfinished, use an earlier proven pair if present;
+    // otherwise numeric slots are provisional and symbolic slots stay fixed.
+    if (!pattern && previous) {
+      const prior = terms[terms.length - 3];
       const separator = sequenceSeparator(fragment.slice(previous.end, last.start));
       const typed = fragment.slice(last.start);
-      const next = separator && completeTerm(previous.parts, String(previous.number + 1), typed);
-      // Juxtaposition alone cannot establish that an absent constant/macro is
-      // meant to repeat. Require its presence, or an explicit list separator.
+      const reference = (prior && inferPattern(prior.parts, previous.parts)) || provisionalPattern(previous.parts, typed);
+      const next = separator && reference && completeTerm(reference.parts, String(reference.secondNumber + 1), typed);
       const missingConstant = separator?.key === '' && last.parts.length < previous.parts.length &&
         sameParts(last.parts, previous.parts.slice(0, last.parts.length)) &&
         previous.parts.slice(last.parts.length).some((part) => part.fixed);
-      if (next && next.suffix && typed.includes('_') && !missingConstant) { terms.pop(); last = previous; }
+      if (next?.suffix && typed.includes('_') && !missingConstant) {
+        terms.pop(); last = previous; previous = prior;
+        pattern = previous && inferPattern(previous.parts, last.parts);
+      }
     }
-    if (last.number === null) return null;
-    let tail = fragment.slice(last.end), partial = '', separator, second = last, runEnd = terms.length - 1;
-    // Find a partial next term after a supported operator (or juxtaposition).
+    let tail = fragment.slice(last.end), partial = '', separator, runEnd = terms.length - 1;
+    let template, secondNumber;
     const split = new RegExp('^(\\s*' + SEQUENCE_OPERATOR + '\\s*|[ \\t]*)([\\s\\S]+)$').exec(tail);
-    const next = split && split[2].includes('_') && completeTerm(last.parts, String(last.number + 1), split[2]);
+    const reference = pattern || provisionalPattern(last.parts, split?.[2] || '');
+    if (!reference) return null;
+    const next = split && split[2].includes('_') && completeTerm(reference.parts, String(reference.secondNumber + 1), split[2]);
     if (next) {
       separator = sequenceSeparator(split[1]);
       if (!separator) return null;
       partial = next.suffix;
-      second = { ...last, number: last.number + 1, parts: next.parts, end: fragment.length };
+      template = next.parts;
+      secondNumber = reference.secondNumber + 1;
       tail = '';
     } else {
-      const previous = terms[terms.length - 2];
-      if (!previous || previous.number === null || last.number !== previous.number + 1 || !sameParts(previous.parts, last.parts)) return null;
+      if (!pattern) return null;
       separator = sequenceSeparator(fragment.slice(previous.end, last.start));
       if (!separator) return null;
+      template = pattern.parts;
+      secondNumber = pattern.secondNumber;
       runEnd--;
     }
     let first = terms[runEnd];
+    let firstNumber = numberIndex(patternValue(first.parts, template) || '');
+    if (firstNumber === null) return null;
     while (runEnd > 0) {
       const candidate = terms[runEnd - 1];
       const between = sequenceSeparator(fragment.slice(candidate.end, first.start));
-      if (candidate.number === null || !sameParts(candidate.parts, first.parts) || candidate.number + 1 !== first.number || between?.key !== separator.key) break;
+      const number = numberIndex(patternValue(candidate.parts, template) || '');
+      if (number === null || number + 1 !== firstNumber || between?.key !== separator.key) break;
       first = candidate;
+      firstNumber = number;
       runEnd--;
     }
-    // An earlier mismatched term/operator invalidates the run rather than
-    // silently making its last two terms a fresh sequence. '=' may introduce it.
+    // The same fixed/changing mask must hold throughout the run; a malformed
+    // earlier term cannot silently turn into a different, valid suffix list.
     if (runEnd > 0) {
       const earlier = sequenceSeparator(fragment.slice(terms[runEnd - 1].end, first.start));
       if (earlier && (earlier.key === separator.key || earlier.key !== '=')) return null;
@@ -465,32 +580,37 @@
     const dots = ellipsisTail(tail, separator);
     const trailing = sequenceSeparator(tail);
     if (!dots && (!trailing || (tail.trim() && trailing.key !== separator.key))) return null;
-    let endpoint = inferEndpoint(parsed, second.parts, first.number, cursor, settings, separator);
+    let endpoint = inferEndpoint(parsed, template, firstNumber, cursor, settings, separator);
     if (dots?.typed) {
       // A value already supplied by the user is stronger evidence than a default
       // (e.g. ...p_m^{k_| should finish k_m, even when the default is n).
-      const values = [];
+      const values = [], slots = indexSlots(template);
+      let slot = 0;
       for (let at = 0; at < dots.typed.length; at++) {
         if (dots.typed[at] !== '_' || escaped(dots.typed, at)) continue;
         const argument = scriptArgument(dots.typed, at + 1);
         const partial = !argument && /^\s*\{([^{}]*)$/.exec(dots.typed.slice(at + 1));
         const value = argument ? dots.typed.slice(argument.from, argument.to).trim() : partial?.[1].trim();
-        if (value && endpointValue(value)) values.push(value);
+        if (value && endpointValue(value)) {
+          if (slots[slot]?.varying) values.push(value);
+          slot++;
+          if (argument) at = argument.end - 1;
+        }
       }
       if (values.length && values.every((value) => compact(value) === compact(values[0])) &&
-          completeTerm(second.parts, values[0], dots.typed)) {
+          completeTerm(template, values[0], dots.typed)) {
         endpoint = { value: values[0], source: 'typed' };
       }
     }
-    if (/^\d+$/.test(endpoint.value) && Number(endpoint.value) <= second.number) return null;
-    const ending = completeTerm(second.parts, endpoint.value, dots?.typed || '');
+    if (/^\d+$/.test(endpoint.value) && Number(endpoint.value) <= secondNumber) return null;
+    const ending = completeTerm(template, endpoint.value, dots?.typed || '');
     if (!ending) return null;
     const missingSeparator = tail.trim()
       ? /\s*$/.exec(separator.raw)[0].slice(/\s*$/.exec(tail)[0].length)
       : separator.raw.replace(/^\s*/, (space) => space.slice(tail.length));
     let suffix;
     if (dots) suffix = latexJoin(tail, (dots.hasSeparator ? '' : separator.raw) + ending.suffix).slice(tail.length);
-    else if (/^\d+$/.test(endpoint.value) && Number(endpoint.value) === second.number + 1) {
+    else if (/^\d+$/.test(endpoint.value) && Number(endpoint.value) === secondNumber + 1) {
       suffix = latexJoin(partial + missingSeparator, ending.text);
     } else {
       suffix = latexJoin(partial + missingSeparator + endpoint.dots + separator.raw, ending.text);
